@@ -142,27 +142,42 @@ git push origin v0.1.0
 
 ### 3. Build Release Binaries
 
+**Option A: Use the build script (recommended)**
+
+```bash
+./build-release.sh v0.1.0
+```
+
+**Option B: Manual build**
+
 ```bash
 # Build idle-scaler for multiple platforms
 cd idle-scaler
 
+# Set version for embedding
+VERSION=v0.1.0
+
 # Linux AMD64
-GOOS=linux GOARCH=amd64 go build -o ../release/idle-scaler-linux-amd64 .
+GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../release/idle-scaler-linux-amd64 .
 
 # Linux ARM64
-GOOS=linux GOARCH=arm64 go build -o ../release/idle-scaler-linux-arm64 .
+GOOS=linux GOARCH=arm64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../release/idle-scaler-linux-arm64 .
 
 # macOS AMD64 (Intel)
-GOOS=darwin GOARCH=amd64 go build -o ../release/idle-scaler-darwin-amd64 .
+GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../release/idle-scaler-darwin-amd64 .
 
 # macOS ARM64 (Apple Silicon)
-GOOS=darwin GOARCH=arm64 go build -o ../release/idle-scaler-darwin-arm64 .
+GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../release/idle-scaler-darwin-arm64 .
 
 # Windows AMD64
-GOOS=windows GOARCH=amd64 go build -o ../release/idle-scaler-windows-amd64.exe .
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.version=${VERSION}" -o ../release/idle-scaler-windows-amd64.exe .
 
 cd ..
 ```
+
+**Note**: The `-ldflags` include:
+- `-s -w`: Strip debug info to reduce binary size
+- `-X main.version=${VERSION}`: Embed version string in the binary
 
 ### 4. Create GitHub Release
 
@@ -214,13 +229,13 @@ List any breaking changes and migration instructions.
 
 Add to your Traefik configuration:
 
-\`\`\`yaml
+```yaml
 experimental:
   plugins:
     scalewaker:
       moduleName: "github.com/Metatable-ai/nomad_scale_to_zero/traefik-plugin"
       version: "v0.1.0"
-\`\`\`
+```
 
 #### Idle-Scaler Binary
 
@@ -232,12 +247,12 @@ Download the appropriate binary for your platform:
 - macOS Apple Silicon: `idle-scaler-darwin-arm64`
 - Windows: `idle-scaler-windows-amd64.exe`
 
-\`\`\`bash
+```bash
 # Example: Download and run on Linux
 wget https://github.com/Metatable-ai/nomad_scale_to_zero/releases/download/v0.1.0/idle-scaler-linux-amd64
 chmod +x idle-scaler-linux-amd64
 ./idle-scaler-linux-amd64 --help
-\`\`\`
+```
 
 ### 📚 Documentation
 

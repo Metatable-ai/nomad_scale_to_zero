@@ -44,7 +44,16 @@ cd ..
 echo ""
 echo "Generating checksums..."
 cd "${OUTPUT_DIR}"
-sha256sum idle-scaler-* > checksums.txt
+
+# Use appropriate checksum command based on OS
+if command -v sha256sum &> /dev/null; then
+    sha256sum idle-scaler-* > checksums.txt
+elif command -v shasum &> /dev/null; then
+    shasum -a 256 idle-scaler-* > checksums.txt
+else
+    echo "Warning: Neither sha256sum nor shasum found. Skipping checksum generation."
+fi
+
 cd ..
 
 echo ""
@@ -53,6 +62,8 @@ echo ""
 echo "Binaries are in the ${OUTPUT_DIR}/ directory:"
 ls -lh "${OUTPUT_DIR}/"
 
-echo ""
-echo "Checksums:"
-cat "${OUTPUT_DIR}/checksums.txt"
+if [ -f "${OUTPUT_DIR}/checksums.txt" ]; then
+    echo ""
+    echo "Checksums:"
+    cat "${OUTPUT_DIR}/checksums.txt"
+fi
