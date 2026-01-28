@@ -302,6 +302,11 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 - 💬 **Questions**: Use [GitHub Discussions](https://github.com/Metatable-ai/nomad_scale_to_zero/discussions) for questions
 - 🔧 **Component Docs**: See [activity-store/README.md](activity-store/README.md) and [idle-scaler/README.md](idle-scaler/README.md)
 
+### For Maintainers
+
+- 🚀 **Creating Releases**: See [RELEASE.md](RELEASE.md) for the complete release process
+- 📝 **Changelog**: See [CHANGELOG.md](CHANGELOG.md) for version history
+
 ## 🗺️ Roadmap
 
 Future enhancements we're considering:
