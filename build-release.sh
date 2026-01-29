@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Metatable Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Build script for creating release binaries
 
 set -e

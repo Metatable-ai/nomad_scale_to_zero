@@ -1,3 +1,8 @@
+<!--
+// Copyright 2026 Metatable Inc.
+// SPDX-License-Identifier: Apache-2.0
+-->
+
 # Nomad Scale-to-Zero
 
 > **Automatic scale-to-zero for HashiCorp Nomad workloads with Traefik and wake-on-request**

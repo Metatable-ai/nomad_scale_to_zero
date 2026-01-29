@@ -1,3 +1,8 @@
+<!--
+// Copyright 2026 Metatable Inc.
+// SPDX-License-Identifier: Apache-2.0
+-->
+
 # Activity Store
 
 Provides a simple interface for recording and reading last activity timestamps and job specs.

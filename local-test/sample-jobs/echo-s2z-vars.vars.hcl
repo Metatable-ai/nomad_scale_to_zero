@@ -1,3 +1,6 @@
+// Copyright 2026 Metatable Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 service_name = "echo-s2z-vars"
 host         = "echo-s2z-vars.localhost"
 image        = "hashicorp/http-echo"

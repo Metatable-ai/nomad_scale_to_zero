@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Metatable Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

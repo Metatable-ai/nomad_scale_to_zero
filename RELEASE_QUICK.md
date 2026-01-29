@@ -1,3 +1,8 @@
+<!--
+// Copyright 2026 Metatable Inc.
+// SPDX-License-Identifier: Apache-2.0
+-->
+
 # Quick Release Guide
 
 This is a condensed version of [RELEASE.md](RELEASE.md) for quick reference.

@@ -1,3 +1,8 @@
+<!--
+// Copyright 2026 Metatable Inc.
+// SPDX-License-Identifier: Apache-2.0
+-->
+
 # Idle Scaler
 
 Runs a periodic check against Nomad jobs marked with scale-to-zero metadata and scales idle groups to 0.

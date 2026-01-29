@@ -1,3 +1,8 @@
+<!--
+// Copyright 2026 Metatable Inc.
+// SPDX-License-Identifier: Apache-2.0
+-->
+
 # Contributing to Nomad Scale-to-Zero
 
 👋 **Welcome!** Thank you for considering contributing to Nomad Scale-to-Zero! We're excited to have you join our community.

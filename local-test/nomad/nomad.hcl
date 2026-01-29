@@ -1,3 +1,6 @@
+// Copyright 2026 Metatable Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 data_dir  = "/tmp/nomad"
 bind_addr = "0.0.0.0"
 

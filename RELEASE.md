@@ -1,3 +1,8 @@
+<!--
+// Copyright 2026 Metatable Inc.
+// SPDX-License-Identifier: Apache-2.0
+-->
+
 # Release Guide
 
 This document describes what should be included in a release of Nomad Scale-to-Zero and the process for creating releases.

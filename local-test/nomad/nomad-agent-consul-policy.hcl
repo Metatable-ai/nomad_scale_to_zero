@@ -1,3 +1,6 @@
+// Copyright 2026 Metatable Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 # Policy for Nomad agent to register/deregister services in Consul
 agent_prefix "" {
   policy = "read"

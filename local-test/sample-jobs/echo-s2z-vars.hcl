@@ -1,3 +1,6 @@
+// Copyright 2026 Metatable Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 variable "service_name" {
   type    = string
   default = "echo-s2z-vars"

@@ -1,3 +1,6 @@
+// Copyright 2026 Metatable Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 module nomad_scale_to_zero/activity-store
 
 go 1.25.5
