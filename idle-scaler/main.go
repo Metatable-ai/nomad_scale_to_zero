@@ -148,13 +148,16 @@ func (s *IdleScaler) RunOnce(ctx context.Context) error {
 
 		timeout := s.defaultTO
 		if raw := jobInfo.Meta[metaIdleTimeout]; raw != "" {
-			if parsed, err := time.ParseDuration(raw + "s"); err == nil {
+			if parsed, err := time.ParseDuration(raw); err == nil {
 				timeout = parsed
+			} else if seconds, err := strconv.Atoi(raw); err == nil {
+				timeout = time.Duration(seconds) * time.Second
 			}
 		}
 
 		if err := s.maybeScaleToZero(ctx, jobInfo, timeout); err != nil {
-			return err
+			log.Printf("scale-to-zero check %s: %v", job.ID, err)
+			continue
 		}
 	}
 

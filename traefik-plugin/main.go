@@ -176,8 +176,8 @@ func (s *ScaleWaker) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	if err := s.recordActivity(ctx, service); err != nil {
-		http.Error(rw, fmt.Sprintf("activity store: %v", err), http.StatusServiceUnavailable)
-		return
+		// Log but don't block the request — activity recording is best-effort
+		fmt.Printf("[scalewaker] activity store error (non-fatal): %v\n", err)
 	}
 
 	s.proxyTo(rw, req, endpoint)
@@ -420,9 +420,6 @@ func (s *ScaleWaker) jobSpecKey(job string) string {
 }
 
 func (s *ScaleWaker) getJobSpec(ctx context.Context, key string) ([]byte, error) {
-	// Debug: log which store we're using
-	fmt.Printf("[scalewaker] getJobSpec: store=%s, redisAddr=%s, key=%s\n", s.jobSpecStore, s.redisAddr, key)
-
 	if s.jobSpecStore == "redis" && s.redisAddr != "" {
 		return s.getRedisValue(ctx, key)
 	}
@@ -454,7 +451,8 @@ func (s *ScaleWaker) getConsulKV(ctx context.Context, key string) ([]byte, error
 	return io.ReadAll(resp.Body)
 }
 
-// getRedisValue retrieves a value from Redis using simple RESP protocol
+// getRedisValue retrieves a value from Redis using RESP protocol with
+// buffered, length-based reads. Supports payloads up to several MB.
 func (s *ScaleWaker) getRedisValue(ctx context.Context, key string) ([]byte, error) {
 	conn, err := net.DialTimeout("tcp", s.redisAddr, 5*time.Second)
 	if err != nil {
@@ -471,17 +469,8 @@ func (s *ScaleWaker) getRedisValue(ctx context.Context, key string) ([]byte, err
 
 	// AUTH if password is set
 	if s.redisPass != "" {
-		authCmd := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(s.redisPass), s.redisPass)
-		if _, err := conn.Write([]byte(authCmd)); err != nil {
-			return nil, fmt.Errorf("redis auth write: %w", err)
-		}
-		authResp := make([]byte, 128)
-		n, err := conn.Read(authResp)
-		if err != nil {
-			return nil, fmt.Errorf("redis auth read: %w", err)
-		}
-		if !strings.HasPrefix(string(authResp[:n]), "+OK") {
-			return nil, fmt.Errorf("redis auth failed: %s", string(authResp[:n]))
+		if err := s.respAuth(conn); err != nil {
+			return nil, err
 		}
 	}
 
@@ -491,44 +480,84 @@ func (s *ScaleWaker) getRedisValue(ctx context.Context, key string) ([]byte, err
 		return nil, fmt.Errorf("redis get write: %w", err)
 	}
 
-	// Read response
-	buf := make([]byte, 64*1024) // 64KB buffer for job specs
-	n, err := conn.Read(buf)
+	return s.respReadBulkString(conn, key)
+}
+
+// respAuth sends AUTH and reads the +OK response.
+func (s *ScaleWaker) respAuth(conn net.Conn) error {
+	authCmd := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(s.redisPass), s.redisPass)
+	if _, err := conn.Write([]byte(authCmd)); err != nil {
+		return fmt.Errorf("redis auth write: %w", err)
+	}
+	line, err := respReadLine(conn)
+	if err != nil {
+		return fmt.Errorf("redis auth read: %w", err)
+	}
+	if !strings.HasPrefix(line, "+OK") {
+		return fmt.Errorf("redis auth failed: %s", line)
+	}
+	return nil
+}
+
+// respReadLine reads bytes one-at-a-time until it finds \r\n.
+// Used only for short protocol lines (<1 KB), not bulk data.
+func respReadLine(conn net.Conn) (string, error) {
+	var buf []byte
+	b := make([]byte, 1)
+	for {
+		_, err := io.ReadFull(conn, b)
+		if err != nil {
+			return "", err
+		}
+		buf = append(buf, b[0])
+		if len(buf) >= 2 && buf[len(buf)-2] == '\r' && buf[len(buf)-1] == '\n' {
+			return string(buf[:len(buf)-2]), nil
+		}
+		if len(buf) > 1024 {
+			return "", fmt.Errorf("resp line too long")
+		}
+	}
+}
+
+// respReadBulkString parses a RESP bulk-string response using the
+// declared length, reading exactly that number of bytes via io.ReadFull.
+func (s *ScaleWaker) respReadBulkString(conn net.Conn, key string) ([]byte, error) {
+	// Read the first line: $<length>\r\n  or  $-1\r\n  or  -ERR ...\r\n
+	line, err := respReadLine(conn)
 	if err != nil {
 		return nil, fmt.Errorf("redis get read: %w", err)
 	}
 
-	resp := string(buf[:n])
-
-	// Parse RESP response
-	if strings.HasPrefix(resp, "$-1") {
+	if strings.HasPrefix(line, "$-1") {
 		return nil, fmt.Errorf("job spec not found at %s", key)
 	}
-	if strings.HasPrefix(resp, "-") {
-		return nil, fmt.Errorf("redis error: %s", strings.TrimSpace(resp[1:]))
+	if strings.HasPrefix(line, "-") {
+		return nil, fmt.Errorf("redis error: %s", strings.TrimSpace(line[1:]))
 	}
-	if strings.HasPrefix(resp, "$") {
-		// Bulk string: $<length>\r\n<data>\r\n
-		idx := strings.Index(resp, "\r\n")
-		if idx == -1 {
-			return nil, fmt.Errorf("invalid redis response")
-		}
-		dataStart := idx + 2
-		dataEnd := strings.LastIndex(resp, "\r\n")
-		if dataEnd <= dataStart {
-			dataEnd = len(resp)
-		}
-		return []byte(resp[dataStart:dataEnd]), nil
+	if !strings.HasPrefix(line, "$") {
+		return nil, fmt.Errorf("unexpected redis response: %.50s", line)
 	}
 
-	return nil, fmt.Errorf("unexpected redis response: %s", resp[:min(50, len(resp))])
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
+	// Parse declared payload length
+	var length int
+	if _, err := fmt.Sscanf(line, "$%d", &length); err != nil {
+		return nil, fmt.Errorf("invalid bulk string length: %w", err)
 	}
-	return b
+	if length < 0 {
+		return nil, fmt.Errorf("job spec not found at %s", key)
+	}
+	const maxPayload = 16 * 1024 * 1024 // 16 MB safety limit
+	if length > maxPayload {
+		return nil, fmt.Errorf("redis payload too large: %d bytes (max %d)", length, maxPayload)
+	}
+
+	// Read exactly `length` bytes of data + trailing \r\n
+	data := make([]byte, length+2) // +2 for trailing \r\n
+	if _, err := io.ReadFull(conn, data); err != nil {
+		return nil, fmt.Errorf("redis bulk read: %w", err)
+	}
+
+	return data[:length], nil
 }
 
 func (s *ScaleWaker) scaleUp(ctx context.Context, job, group string) error {
@@ -703,17 +732,8 @@ func (s *ScaleWaker) setRedisValue(ctx context.Context, key, value string) error
 	}
 
 	if s.redisPass != "" {
-		authCmd := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(s.redisPass), s.redisPass)
-		if _, err := conn.Write([]byte(authCmd)); err != nil {
-			return fmt.Errorf("redis auth write: %w", err)
-		}
-		authResp := make([]byte, 128)
-		n, err := conn.Read(authResp)
-		if err != nil {
-			return fmt.Errorf("redis auth read: %w", err)
-		}
-		if !strings.HasPrefix(string(authResp[:n]), "+OK") {
-			return fmt.Errorf("redis auth failed: %s", string(authResp[:n]))
+		if err := s.respAuth(conn); err != nil {
+			return err
 		}
 	}
 
@@ -722,13 +742,12 @@ func (s *ScaleWaker) setRedisValue(ctx context.Context, key, value string) error
 		return fmt.Errorf("redis set write: %w", err)
 	}
 
-	resp := make([]byte, 128)
-	n, err := conn.Read(resp)
+	line, err := respReadLine(conn)
 	if err != nil {
 		return fmt.Errorf("redis set read: %w", err)
 	}
-	if !strings.HasPrefix(string(resp[:n]), "+OK") {
-		return fmt.Errorf("redis set failed: %s", strings.TrimSpace(string(resp[:n])))
+	if !strings.HasPrefix(line, "+OK") {
+		return fmt.Errorf("redis set failed: %s", strings.TrimSpace(line))
 	}
 
 	return nil
