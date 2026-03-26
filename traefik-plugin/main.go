@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -59,6 +60,7 @@ type ScaleWaker struct {
 	group         string
 	service       string
 	client        *http.Client
+	logger        *slog.Logger
 
 	// wakeupLocks prevents multiple concurrent scale-ups for the same service
 	wakeupLocks sync.Map // map[string]*wakeupState
@@ -106,6 +108,12 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	redisPass := coalesce(config.RedisPassword, os.Getenv("S2Z_REDIS_PASSWORD"))
 	nomadToken := coalesce(config.NomadToken, os.Getenv("S2Z_NOMAD_TOKEN"))
 	consulToken := coalesce(config.ConsulToken, os.Getenv("S2Z_CONSUL_TOKEN"))
+	if nomadToken == "" {
+		nomadToken = readBootstrapToken("NOMAD_S2Z_TOKEN")
+	}
+	if consulToken == "" {
+		consulToken = readBootstrapToken("CONSUL_S2Z_TOKEN")
+	}
 	activityStore := coalesce(config.ActivityStore, os.Getenv("S2Z_ACTIVITY_STORE"), "consul")
 	jobSpecStore := coalesce(config.JobSpecStore, os.Getenv("S2Z_JOB_SPEC_STORE"), "consul")
 	if strings.EqualFold(activityStore, "redis") && redisAddr == "" {
@@ -132,6 +140,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		group:         config.GroupName,
 		service:       config.ServiceName,
 		client:        client,
+		logger:        newPluginLogger(name),
 	}, nil
 }
 
@@ -147,13 +156,16 @@ func coalesce(values ...string) string {
 func (s *ScaleWaker) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	service, job, group := s.resolveTarget(req)
+	logger := s.log().With("service", service, "job", job, "group", group, "host", req.Host, "path", req.URL.Path)
 	if service == "" || job == "" || group == "" {
+		logger.WarnContext(ctx, "missing service mapping")
 		http.Error(rw, "missing service mapping", http.StatusServiceUnavailable)
 		return
 	}
 
 	endpoint, healthy, err := s.getHealthyEndpoint(ctx, service)
 	if err != nil {
+		logger.WarnContext(ctx, "consul health lookup failed", "error", err)
 		http.Error(rw, fmt.Sprintf("health check: %v", err), http.StatusServiceUnavailable)
 		return
 	}
@@ -162,25 +174,35 @@ func (s *ScaleWaker) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// (handles stale/orphaned Consul catalog entries)
 	if healthy {
 		if !s.isEndpointReachable(endpoint) {
+			logger.WarnContext(ctx, "consul returned stale endpoint", "target", endpoint.String())
 			healthy = false
 		}
 	}
 
 	if !healthy {
+		logger.InfoContext(ctx, "service unhealthy, attempting wake")
 		// Use per-service lock to prevent concurrent wake-ups
 		endpoint, err = s.wakeUpService(ctx, service, job, group)
 		if err != nil {
+			logger.ErrorContext(ctx, "service wake-up failed", "error", err)
 			http.Error(rw, fmt.Sprintf("wake up: %v", err), http.StatusServiceUnavailable)
 			return
 		}
+		logger.InfoContext(ctx, "service wake-up completed", "target", endpoint.String())
 	}
 
 	if err := s.recordActivity(ctx, service); err != nil {
-		// Log but don't block the request — activity recording is best-effort
-		fmt.Printf("[scalewaker] activity store error (non-fatal): %v\n", err)
+		logger.WarnContext(ctx, "activity store update failed", "error", err)
 	}
 
-	s.proxyTo(rw, req, endpoint)
+	s.proxyTo(rw, req, endpoint, logger)
+}
+
+func (s *ScaleWaker) log() *slog.Logger {
+	if s != nil && s.logger != nil {
+		return s.logger
+	}
+	return newPluginLogger("scalewaker")
 }
 
 // isEndpointReachable quickly checks if an endpoint can accept TCP connections
@@ -753,9 +775,10 @@ func (s *ScaleWaker) setRedisValue(ctx context.Context, key, value string) error
 	return nil
 }
 
-func (s *ScaleWaker) proxyTo(rw http.ResponseWriter, req *http.Request, target *url.URL) {
+func (s *ScaleWaker) proxyTo(rw http.ResponseWriter, req *http.Request, target *url.URL, logger *slog.Logger) {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		logger.WarnContext(req.Context(), "reverse proxy request failed", "error", err, "target", target.String())
 		http.Error(rw, fmt.Sprintf("proxy error: %v", err), http.StatusBadGateway)
 	}
 	proxy.Director = func(r *http.Request) {

@@ -7,11 +7,15 @@ set -eu
 job_name="$1"
 expected_running="$2"
 timeout_seconds="${3:-120}"
-nomad_addr="${E2E_NOMAD_ADDR:-http://nomad:4646}"
+nomad_addr="${E2E_NOMAD_ADDR:-http://nomad-server:4646}"
 
 start="$(date +%s)"
 while true; do
-  job_allocations_json="$(curl -fsS "$nomad_addr/v1/job/$job_name/allocations" 2>/dev/null || true)"
+  if [ -n "${NOMAD_TOKEN:-}" ]; then
+    job_allocations_json="$(curl -fsS -H "X-Nomad-Token: $NOMAD_TOKEN" "$nomad_addr/v1/job/$job_name/allocations" 2>/dev/null || true)"
+  else
+    job_allocations_json="$(curl -fsS "$nomad_addr/v1/job/$job_name/allocations" 2>/dev/null || true)"
+  fi
   if [ -n "$job_allocations_json" ]; then
     running="$(printf '%s' "$job_allocations_json" | jq -r '[.[] | select(.ClientStatus == "running")] | length')"
   else
@@ -26,7 +30,11 @@ while true; do
   now="$(date +%s)"
   if [ $((now - start)) -ge "$timeout_seconds" ]; then
     echo "Timed out waiting for $job_name to reach running=$expected_running (last running=$running)" >&2
-    curl -fsS "$nomad_addr/v1/job/$job_name/allocations" || true
+    if [ -n "${NOMAD_TOKEN:-}" ]; then
+      curl -fsS -H "X-Nomad-Token: $NOMAD_TOKEN" "$nomad_addr/v1/job/$job_name/allocations" || true
+    else
+      curl -fsS "$nomad_addr/v1/job/$job_name/allocations" || true
+    fi
     exit 1
   fi
 

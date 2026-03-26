@@ -10,6 +10,7 @@ ping:
 
 log:
   level: DEBUG
+  format: json
 
 entryPoints:
   http:
@@ -23,6 +24,7 @@ providers:
     endpoint:
       address: consul:8500
       scheme: http
+      token: ${CONSUL_CATALOG_TOKEN}
     exposedByDefault: false
     watch: true
     refreshInterval: 5s

@@ -31,8 +31,8 @@ job "${E2E_RENDER_JOB_NAME}" {
       }
 
       resources {
-        cpu    = 50
-        memory = 64
+        cpu    = ${E2E_RENDER_JOB_CPU}
+        memory = ${E2E_RENDER_JOB_MEMORY}
       }
 
       service {
@@ -52,9 +52,9 @@ job "${E2E_RENDER_JOB_NAME}" {
 
         check {
           type     = "http"
-          path     = "/"
-          interval = "2s"
-          timeout  = "2s"
+          path     = "/healthz"
+          interval = "${E2E_RENDER_JOB_CHECK_INTERVAL}"
+          timeout  = "${E2E_RENDER_JOB_CHECK_TIMEOUT}"
         }
       }
     }

@@ -4,15 +4,8 @@
 data_dir  = "/tmp/nomad"
 bind_addr = "0.0.0.0"
 
-advertise {
-  http = "nomad"
-  rpc  = "nomad"
-  serf = "nomad"
-}
-
 server {
-  enabled          = true
-  bootstrap_expect = 1
+  enabled = false
 }
 
 acl {
@@ -20,25 +13,21 @@ acl {
 }
 
 client {
-  enabled = true
+  enabled           = true
+  servers           = ["nomad-server:4647"]
   network_interface = "eth0"
-  cpu_total_compute = 2000
-  memory_total_mb   = 2048
+  cpu_total_compute = 4000
+  memory_total_mb   = 4096
   disk_total_mb     = 524288
   disk_free_mb      = 262144
   options = {
-    "driver.raw_exec.enable"      = "1"
-    "driver.docker.enable"        = "1"
-    "driver.raw_exec.no_cgroups"  = "1"
+    "driver.allowlist" = "raw_exec"
   }
 }
 
-plugin "docker" {
+plugin "raw_exec" {
   config {
-    allow_privileged = true
-    volumes {
-      enabled = true
-    }
+    enabled = true
   }
 }
 

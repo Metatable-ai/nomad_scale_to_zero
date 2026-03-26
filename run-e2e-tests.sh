@@ -9,7 +9,7 @@ GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-NOMAD_ADDR="${E2E_NOMAD_ADDR:-http://nomad:4646}"
+NOMAD_ADDR="${E2E_NOMAD_ADDR:-http://nomad-server:4646}"
 CONSUL_ADDR="${E2E_CONSUL_ADDR:-http://consul:8500}"
 TRAEFIK_URL="${E2E_TRAEFIK_BASE_URL:-http://traefik:80}"
 STORE_TYPE="${E2E_STORE_TYPE:-redis}"
@@ -19,6 +19,16 @@ IDLE_CHECK_INTERVAL="${E2E_IDLE_CHECK_INTERVAL:-3s}"
 TRAFFIC_SCENARIO="${E2E_TRAFFIC_SCENARIO:-storm}"
 JOB_COUNT="${E2E_JOB_COUNT:-10}"
 K6_TARGET_MODE="${E2E_K6_TARGET_MODE:-random}"
+
+max_int() {
+	left="$1"
+	right="$2"
+	if [ "$left" -ge "$right" ]; then
+		echo "$left"
+	else
+		echo "$right"
+	fi
+}
 
 idle_timeout_seconds() {
 	value="$1"
@@ -42,6 +52,9 @@ idle_timeout_seconds() {
 }
 
 idle_wait_seconds="$(( $(idle_timeout_seconds "$IDLE_TIMEOUT") + $(idle_timeout_seconds "$IDLE_CHECK_INTERVAL") + 15 ))"
+startup_ready_timeout="${E2E_STARTUP_READY_TIMEOUT:-${E2E_CONSUL_SERVICES_TIMEOUT:-$(max_int $((JOB_COUNT * 3)) 120)}}"
+nomad_wake_timeout="${E2E_NOMAD_WAKE_TIMEOUT:-$(max_int "$JOB_COUNT" 60)}"
+consul_checks_timeout="${E2E_CONSUL_CHECKS_TIMEOUT:-120}"
 
 submit_job() {
 	job_file="$1"
@@ -55,12 +68,16 @@ printf "  E2E_IDLE_CHECK_INTERVAL=%s\n" "$IDLE_CHECK_INTERVAL"
 printf "  E2E_SOAK_CYCLES=%s\n" "$SOAK_CYCLES"
 printf "  E2E_TRAFFIC_SCENARIO=%s\n" "$TRAFFIC_SCENARIO"
 printf "  E2E_STORE_TYPE=%s\n" "$STORE_TYPE"
+printf "  E2E_STARTUP_READY_TIMEOUT=%s\n" "$startup_ready_timeout"
+printf "  E2E_NOMAD_WAKE_TIMEOUT=%s\n" "$nomad_wake_timeout"
+printf "  E2E_CONSUL_CHECKS_TIMEOUT=%s\n" "$consul_checks_timeout"
 
 mkdir -p /tmp/e2e-generated
 
 "$ROOT_DIR"/e2e/scripts/wait-for-http.sh "$CONSUL_ADDR/v1/status/leader" consul
 "$ROOT_DIR"/e2e/scripts/wait-for-http.sh "$NOMAD_ADDR/v1/status/leader" nomad
 "$ROOT_DIR"/e2e/scripts/wait-for-http.sh "$TRAEFIK_URL/ping" traefik
+"$ROOT_DIR"/e2e/scripts/wait-for-consul-checks.sh "_nomad-check-" 1 "$consul_checks_timeout"
 
 printf "${CYAN}=== Generate Nomad jobs ===${NC}\n"
 "$ROOT_DIR"/e2e/scripts/render-workload-jobs.sh
@@ -70,7 +87,7 @@ for job_file in /tmp/e2e-generated/jobs/*.nomad; do
 	submit_job "$job_file"
 done
 
-"$ROOT_DIR"/e2e/scripts/wait-for-consul-services.sh "$JOB_COUNT"
+"$ROOT_DIR"/e2e/scripts/wait-for-nomad-running-count.sh "echo-s2z-" "$JOB_COUNT" exact "$startup_ready_timeout" "$JOB_COUNT"
 
 primary_job="echo-s2z-0001"
 
@@ -94,9 +111,9 @@ while [ "$cycle" -le "$SOAK_CYCLES" ]; do
 	"$ROOT_DIR"/e2e/scripts/run-k6-scenario.sh &
 	k6_pid=$!
 	if [ "$K6_TARGET_MODE" = "fixed" ]; then
-		"$ROOT_DIR"/e2e/scripts/wait-for-nomad-job.sh "$selected_service_name" 1 60
+		"$ROOT_DIR"/e2e/scripts/wait-for-nomad-job.sh "$selected_service_name" 1 "$nomad_wake_timeout"
 	else
-		"$ROOT_DIR"/e2e/scripts/wait-for-nomad-running-count.sh "echo-s2z-" 1 at-least 60 "$JOB_COUNT"
+		"$ROOT_DIR"/e2e/scripts/wait-for-nomad-running-count.sh "echo-s2z-" 1 at-least "$nomad_wake_timeout" "$JOB_COUNT"
 	fi
 	"$ROOT_DIR"/e2e/scripts/collect-redis-info.sh "cycle-${cycle}-post-wake" || true
 	wait "$k6_pid"
@@ -105,6 +122,7 @@ while [ "$cycle" -le "$SOAK_CYCLES" ]; do
 	else
 		"$ROOT_DIR"/e2e/scripts/wait-for-nomad-running-count.sh "echo-s2z-" 0 exact "$idle_wait_seconds" "$JOB_COUNT"
 	fi
+	"$ROOT_DIR"/e2e/scripts/wait-for-consul-checks.sh "_nomad-check-" 1 "$consul_checks_timeout"
 	cycle=$((cycle + 1))
 done
 

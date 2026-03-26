@@ -5,6 +5,8 @@ FROM grafana/k6:latest AS k6
 
 FROM hashicorp/nomad:1.10.5 AS nomad
 
+FROM hashicorp/consul:1.22.2 AS consul
+
 FROM golang:1.25-bookworm
 
 RUN apt-get update \
@@ -32,6 +34,7 @@ RUN cd idle-scaler && go build -o /app/bin/e2e-echo ./cmd/e2e-echo
 # Copy k6 binary into the e2e runner image so orchestration can drive it directly
 COPY --from=k6 /usr/bin/k6 /usr/local/bin/k6
 COPY --from=nomad /bin/nomad /usr/local/bin/nomad
+COPY --from=consul /bin/consul /usr/local/bin/consul
 
 RUN chmod +x /app/run-docker-e2e.sh /app/run-e2e-tests.sh /app/e2e/scripts/*.sh
 

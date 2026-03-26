@@ -42,8 +42,14 @@ func main() {
 		interval    = flag.Duration("interval", envOrDefaultDuration("IDLE_CHECK_INTERVAL", 30*time.Second), "Idle check interval")
 		defaultTO   = flag.Duration("default-idle-timeout", envOrDefaultDuration("DEFAULT_IDLE_TIMEOUT", 5*time.Minute), "Default idle timeout")
 		purgeOnSD   = flag.Bool("purge-on-scaledown", envOrDefaultBool("PURGE_ON_SCALEDOWN", false), "Purge job on scale down when idle")
+		metricsAddr = flag.String("metrics-addr", envOrDefault("METRICS_ADDR", ""), "Observability listen address")
 	)
 	flag.Parse()
+
+	obs := newScalerObservability("idle-scaler")
+	if err := obs.start(*metricsAddr); err != nil {
+		log.Fatalf("observability: %v", err)
+	}
 
 	nomadClient, err := nomad.NewClient(&nomad.Config{Address: *nomadAddr, SecretID: *nomadToken})
 	if err != nil {
@@ -110,7 +116,10 @@ func main() {
 	log.Printf("idle-scaler started (interval=%s, default-timeout=%s)", *interval, *defaultTO)
 	ctx := context.Background()
 	for {
-		if err := scaler.RunOnce(ctx); err != nil {
+		startedAt := time.Now()
+		err := scaler.RunOnce(ctx)
+		obs.observeRun(time.Since(startedAt), err)
+		if err != nil {
 			log.Printf("run error: %v", err)
 		}
 		time.Sleep(*interval)

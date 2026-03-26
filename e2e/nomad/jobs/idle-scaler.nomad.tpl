@@ -16,7 +16,7 @@ job "idle-scaler-e2e" {
       }
 
       env {
-        NOMAD_ADDR           = "http://nomad:4646"
+        NOMAD_ADDR           = "http://nomad-server:4646"
         CONSUL_ADDR          = "http://consul:8500"
         REDIS_ADDR           = "redis:6379"
         REDIS_PASSWORD       = ""

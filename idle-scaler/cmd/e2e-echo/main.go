@@ -1,9 +1,10 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 )
 
 func envOrDefault(key, fallback string) string {
@@ -27,8 +28,14 @@ func listenAddr() string {
 func main() {
 	addr := listenAddr()
 	responseText := envOrDefault("E2E_ECHO_TEXT", "Hello from e2e echo")
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: parseEchoLogLevel(os.Getenv("LOG_LEVEL"))})).With("service", "e2e-echo")
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = w.Write([]byte("ok\n"))
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte(responseText))
 	})
@@ -38,8 +45,22 @@ func main() {
 		Handler: handler,
 	}
 
-	log.Printf("starting e2e echo server on %s", addr)
+	logger.Info("starting e2e echo server", "addr", addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("start e2e echo server: %v", err)
+		logger.Error("failed to start e2e echo server", "error", err)
+		os.Exit(1)
+	}
+}
+
+func parseEchoLogLevel(raw string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
 	}
 }
