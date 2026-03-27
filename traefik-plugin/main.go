@@ -107,9 +107,7 @@ type nomadAllocation struct {
 		Networks []nomadAllocNetwork `json:"Networks"`
 	} `json:"Resources"`
 	AllocatedResources *struct {
-		Shared struct {
-			Networks []nomadAllocNetwork `json:"Networks"`
-		} `json:"Networks"`
+		Networks []nomadAllocNetwork `json:"Networks"`
 	} `json:"AllocatedResources"`
 }
 
@@ -900,8 +898,9 @@ func (s *ScaleWaker) getJobGroupCount(ctx context.Context, job, group string) (i
 }
 
 // getNomadAllocations fetches allocations for a job from the Nomad API.
+// Uses ?resources=true to include network/port info in the response.
 func (s *ScaleWaker) getNomadAllocations(ctx context.Context, job string) ([]nomadAllocation, error) {
-	endpoint := fmt.Sprintf("%s/v1/job/%s/allocations", s.nomadAddr, url.PathEscape(job))
+	endpoint := fmt.Sprintf("%s/v1/job/%s/allocations?resources=true", s.nomadAddr, url.PathEscape(job))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -928,15 +927,15 @@ func (s *ScaleWaker) getNomadAllocations(ctx context.Context, job string) ([]nom
 
 // extractAllocEndpoint returns the first usable address:port from a Nomad allocation.
 func extractAllocEndpoint(alloc nomadAllocation) *url.URL {
-	// Try AllocatedResources first (newer Nomad versions)
+	// Try AllocatedResources first (newer Nomad versions, requires ?resources=true)
 	if alloc.AllocatedResources != nil {
-		for _, net := range alloc.AllocatedResources.Shared.Networks {
+		for _, net := range alloc.AllocatedResources.Networks {
 			if u := firstPort(net); u != nil {
 				return u
 			}
 		}
 	}
-	// Fall back to Resources (legacy)
+	// Fall back to Resources (legacy / always present)
 	for _, net := range alloc.Resources.Networks {
 		if u := firstPort(net); u != nil {
 			return u
