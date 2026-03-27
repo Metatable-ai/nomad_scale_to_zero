@@ -268,6 +268,26 @@ func startBackend(t *testing.T, body string) *backendInfo {
 	return &backendInfo{server: srv, host: host, port: port, entries: entries}
 }
 
+// makeAllocations creates a mock Nomad allocation response pointing at the backend.
+func makeAllocations(group, host string, port int) []nomadAllocation {
+	return []nomadAllocation{{
+		ID:           "alloc-test-12345678",
+		TaskGroup:    group,
+		ClientStatus: "running",
+		TaskStates: map[string]struct{ State string `json:"State"` }{
+			"server": {State: "running"},
+		},
+		Resources: struct {
+			Networks []nomadAllocNetwork `json:"Networks"`
+		}{
+			Networks: []nomadAllocNetwork{{
+				IP:           host,
+				DynamicPorts: []nomadAllocDynPort{{Label: "http", Value: port}},
+			}},
+		},
+	}}
+}
+
 func TestServeHTTP_HealthyService(t *testing.T) {
 	be := startBackend(t, "backend OK")
 	defer be.server.Close()
@@ -357,11 +377,24 @@ func TestServeHTTP_WakeUpFromZero(t *testing.T) {
 			scaleUpCalled = true
 			atomic.StoreInt32(&scaled, 1)
 			w.Write([]byte(`{}`))
+		case strings.HasSuffix(r.URL.Path, "/allocations") && r.Method == http.MethodGet:
+			if atomic.LoadInt32(&scaled) == 1 {
+				json.NewEncoder(w).Encode(makeAllocations("main", be.host, be.port))
+			} else {
+				json.NewEncoder(w).Encode([]nomadAllocation{})
+			}
 		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
 			jobRegistered = true
 			w.Write([]byte(`{}`))
 		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
-			json.NewEncoder(w).Encode(nomadJobInfo{Status: "dead"})
+			count := 0
+			if atomic.LoadInt32(&scaled) == 1 {
+				count = 1
+			}
+			json.NewEncoder(w).Encode(nomadJobInfo{
+				Status:     "dead",
+				TaskGroups: []nomadJobTaskGroup{{Name: "main", Count: count}},
+			})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -432,10 +465,23 @@ func TestServeHTTP_ConcurrentWakeupDedup(t *testing.T) {
 			atomic.AddInt32(&scaleCount, 1)
 			atomic.StoreInt32(&scaled, 1)
 			w.Write([]byte(`{}`))
+		case strings.HasSuffix(r.URL.Path, "/allocations") && r.Method == http.MethodGet:
+			if atomic.LoadInt32(&scaled) == 1 {
+				json.NewEncoder(w).Encode(makeAllocations("main", be.host, be.port))
+			} else {
+				json.NewEncoder(w).Encode([]nomadAllocation{})
+			}
 		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
 			w.Write([]byte(`{}`))
 		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
-			json.NewEncoder(w).Encode(nomadJobInfo{Status: "dead"})
+			count := 0
+			if atomic.LoadInt32(&scaled) == 1 {
+				count = 1
+			}
+			json.NewEncoder(w).Encode(nomadJobInfo{
+				Status:     "dead",
+				TaskGroups: []nomadJobTaskGroup{{Name: "main", Count: count}},
+			})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -525,10 +571,15 @@ func TestServeHTTP_Timeout(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/scale") && r.Method == http.MethodPost:
 			w.Write([]byte(`{}`))
+		case strings.HasSuffix(r.URL.Path, "/allocations") && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode([]nomadAllocation{})
 		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
 			w.Write([]byte(`{}`))
 		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
-			json.NewEncoder(w).Encode(nomadJobInfo{Status: "dead"})
+			json.NewEncoder(w).Encode(nomadJobInfo{
+				Status:     "dead",
+				TaskGroups: []nomadJobTaskGroup{{Name: "main", Count: 0}},
+			})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -605,10 +656,23 @@ func TestServeHTTP_StaleConsulEntry(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/scale") && r.Method == http.MethodPost:
 			atomic.StoreInt32(&wakeupDone, 1)
 			w.Write([]byte(`{}`))
+		case strings.HasSuffix(r.URL.Path, "/allocations") && r.Method == http.MethodGet:
+			if atomic.LoadInt32(&wakeupDone) == 1 {
+				json.NewEncoder(w).Encode(makeAllocations("main", be.host, be.port))
+			} else {
+				json.NewEncoder(w).Encode([]nomadAllocation{})
+			}
 		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
 			w.Write([]byte(`{}`))
 		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
-			json.NewEncoder(w).Encode(nomadJobInfo{Status: "running"})
+			count := 0
+			if atomic.LoadInt32(&wakeupDone) == 1 {
+				count = 1
+			}
+			json.NewEncoder(w).Encode(nomadJobInfo{
+				Status:     "running",
+				TaskGroups: []nomadJobTaskGroup{{Name: "main", Count: count}},
+			})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -705,10 +769,23 @@ func TestStress_ServeHTTP_Burst(t *testing.T) {
 			scaleCount.Add(1)
 			atomic.StoreInt32(&scaled, 1)
 			w.Write([]byte(`{}`))
+		case strings.HasSuffix(r.URL.Path, "/allocations") && r.Method == http.MethodGet:
+			if atomic.LoadInt32(&scaled) == 1 {
+				json.NewEncoder(w).Encode(makeAllocations("main", be.host, be.port))
+			} else {
+				json.NewEncoder(w).Encode([]nomadAllocation{})
+			}
 		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
 			w.Write([]byte(`{}`))
 		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
-			json.NewEncoder(w).Encode(nomadJobInfo{Status: "dead"})
+			count := 0
+			if atomic.LoadInt32(&scaled) == 1 {
+				count = 1
+			}
+			json.NewEncoder(w).Encode(nomadJobInfo{
+				Status:     "dead",
+				TaskGroups: []nomadJobTaskGroup{{Name: "main", Count: count}},
+			})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

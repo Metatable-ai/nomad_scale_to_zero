@@ -61,6 +61,7 @@ type ScaleWaker struct {
 	service       string
 	client        *http.Client
 	logger        *slog.Logger
+	observability *wakeObservability
 
 	// wakeupLocks prevents multiple concurrent scale-ups for the same service
 	wakeupLocks sync.Map // map[string]*wakeupState
@@ -82,7 +83,60 @@ type consulServiceEntry struct {
 }
 
 type nomadJobInfo struct {
-	Status string `json:"Status"`
+	Status     string              `json:"Status"`
+	TaskGroups []nomadJobTaskGroup `json:"TaskGroups"`
+}
+
+type nomadJobTaskGroup struct {
+	Name  string `json:"Name"`
+	Count int    `json:"Count"`
+}
+
+// nomadAllocation represents the subset of Nomad allocation fields we need.
+type nomadAllocation struct {
+	ID           string `json:"ID"`
+	TaskGroup    string `json:"TaskGroup"`
+	ClientStatus string `json:"ClientStatus"`
+	TaskStates   map[string]struct {
+		State string `json:"State"`
+	} `json:"TaskStates"`
+	DeploymentStatus *struct {
+		Healthy *bool `json:"Healthy"`
+	} `json:"DeploymentStatus"`
+	Resources struct {
+		Networks []nomadAllocNetwork `json:"Networks"`
+	} `json:"Resources"`
+	AllocatedResources *struct {
+		Shared struct {
+			Networks []nomadAllocNetwork `json:"Networks"`
+		} `json:"Networks"`
+	} `json:"AllocatedResources"`
+}
+
+type nomadAllocNetwork struct {
+	IP           string              `json:"IP"`
+	DynamicPorts []nomadAllocDynPort `json:"DynamicPorts"`
+	ReservedPorts []nomadAllocDynPort `json:"ReservedPorts"`
+}
+
+type nomadAllocDynPort struct {
+	Label string `json:"Label"`
+	Value int    `json:"Value"`
+	To    int    `json:"To"`
+}
+
+var errWaitForHealthyTimeout = errors.New("timeout waiting for service")
+
+type waitForHealthyTimeoutError struct {
+	service string
+}
+
+func (e waitForHealthyTimeoutError) Error() string {
+	return fmt.Sprintf("%s %s", errWaitForHealthyTimeout, e.service)
+}
+
+func (e waitForHealthyTimeoutError) Is(target error) bool {
+	return target == errWaitForHealthyTimeout
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
@@ -141,6 +195,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		service:       config.ServiceName,
 		client:        client,
 		logger:        newPluginLogger(name),
+		observability: defaultWakeObservabilityInstance(),
 	}, nil
 }
 
@@ -179,9 +234,18 @@ func (s *ScaleWaker) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	// Stale-guard: if Consul says healthy but Nomad job has count=0,
+	// the endpoint is from a draining allocation — force wake path.
+	if healthy {
+		count, countErr := s.getJobGroupCount(ctx, job, group)
+		if countErr == nil && count == 0 {
+			logger.WarnContext(ctx, "stale consul endpoint detected (nomad count=0)", "target", endpoint.String())
+			healthy = false
+		}
+	}
+
 	if !healthy {
 		logger.InfoContext(ctx, "service unhealthy, attempting wake")
-		// Use per-service lock to prevent concurrent wake-ups
 		endpoint, err = s.wakeUpService(ctx, service, job, group)
 		if err != nil {
 			logger.ErrorContext(ctx, "service wake-up failed", "error", err)
@@ -195,7 +259,10 @@ func (s *ScaleWaker) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		logger.WarnContext(ctx, "activity store update failed", "error", err)
 	}
 
-	s.proxyTo(rw, req, endpoint, logger)
+	// Proxy with single retry through wake path on failure.
+	if !s.proxyToWithRetry(rw, req, endpoint, service, job, group, logger) {
+		logger.ErrorContext(ctx, "proxy failed after retry")
+	}
 }
 
 func (s *ScaleWaker) log() *slog.Logger {
@@ -238,29 +305,48 @@ func (s *ScaleWaker) wakeUpService(ctx context.Context, service, job, group stri
 	if err != nil {
 		return nil, err
 	}
+	obs := s.observabilityMetrics()
 	if healthy && s.isEndpointReachable(endpoint) {
-		return endpoint, nil
+		// Double-check: is this a stale endpoint from a draining allocation?
+		count, countErr := s.getJobGroupCount(ctx, job, group)
+		if countErr == nil && count == 0 {
+			// Stale — fall through to wake
+		} else {
+			start := time.Now()
+			obs.observeAttempt()
+			obs.observeOutcome(wakeResultAlreadyHealthy, time.Since(start))
+			return endpoint, nil
+		}
 	}
 
 	// We're the one doing the wake-up
+	start := time.Now()
+	obs.observeAttempt()
+
 	if err := s.ensureJob(ctx, job); err != nil {
+		obs.observeOutcome(wakeResultEnsureJobError, time.Since(start))
 		return nil, fmt.Errorf("ensure job: %w", err)
 	}
 	if err := s.scaleUp(ctx, job, group); err != nil {
-		// If scaling fails, still wait for the service to become healthy
+		// If scaling fails, still wait for the service via Nomad
 		// (e.g., another deployment is already in progress).
-		endpoint, waitErr := s.waitForHealthy(ctx, service)
+		endpoint, waitErr := s.waitForNomadAllocation(ctx, job, group)
 		if waitErr == nil {
+			obs.observeOutcome(wakeResultSuccessAfterScaleError, time.Since(start))
 			return endpoint, nil
 		}
+		obs.observeOutcome(wakeResultScaleUpError, time.Since(start))
 		return nil, fmt.Errorf("scale up: %w", err)
 	}
 
-	endpoint, err = s.waitForHealthy(ctx, service)
+	// Poll Nomad directly for allocation health — bypasses Consul registration lag
+	endpoint, err = s.waitForNomadAllocation(ctx, job, group)
 	if err != nil {
-		return nil, fmt.Errorf("wait healthy: %w", err)
+		obs.observeOutcome(wakeResultForWaitError(err), time.Since(start))
+		return nil, fmt.Errorf("wait allocation: %w", err)
 	}
 
+	obs.observeOutcome(wakeResultSuccess, time.Since(start))
 	return endpoint, nil
 }
 
@@ -623,7 +709,7 @@ func (s *ScaleWaker) waitForHealthy(ctx context.Context, service string) (*url.U
 	var lastIndex string
 	for {
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timeout waiting for service %s", service)
+			return nil, waitForHealthyTimeoutError{service: service}
 		}
 
 		remaining := time.Until(deadline)
@@ -773,6 +859,274 @@ func (s *ScaleWaker) setRedisValue(ctx context.Context, key, value string) error
 	}
 
 	return nil
+}
+
+// getJobGroupCount returns the configured count for a task group from the Nomad
+// job definition. Used as a stale-guard: if count=0, any Consul "healthy"
+// endpoint is from a draining allocation.
+func (s *ScaleWaker) getJobGroupCount(ctx context.Context, job, group string) (int, error) {
+	endpoint := fmt.Sprintf("%s/v1/job/%s", s.nomadAddr, url.PathEscape(job))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return -1, err
+	}
+	s.addNomadToken(req)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return -1, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return 0, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(resp.Body)
+		return -1, fmt.Errorf("nomad job status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+
+	var info nomadJobInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return -1, err
+	}
+
+	for _, tg := range info.TaskGroups {
+		if tg.Name == group {
+			return tg.Count, nil
+		}
+	}
+	return 0, nil
+}
+
+// getNomadAllocations fetches allocations for a job from the Nomad API.
+func (s *ScaleWaker) getNomadAllocations(ctx context.Context, job string) ([]nomadAllocation, error) {
+	endpoint := fmt.Sprintf("%s/v1/job/%s/allocations", s.nomadAddr, url.PathEscape(job))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	s.addNomadToken(req)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("nomad allocations status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+
+	var allocs []nomadAllocation
+	if err := json.NewDecoder(resp.Body).Decode(&allocs); err != nil {
+		return nil, err
+	}
+	return allocs, nil
+}
+
+// extractAllocEndpoint returns the first usable address:port from a Nomad allocation.
+func extractAllocEndpoint(alloc nomadAllocation) *url.URL {
+	// Try AllocatedResources first (newer Nomad versions)
+	if alloc.AllocatedResources != nil {
+		for _, net := range alloc.AllocatedResources.Shared.Networks {
+			if u := firstPort(net); u != nil {
+				return u
+			}
+		}
+	}
+	// Fall back to Resources (legacy)
+	for _, net := range alloc.Resources.Networks {
+		if u := firstPort(net); u != nil {
+			return u
+		}
+	}
+	return nil
+}
+
+func firstPort(net nomadAllocNetwork) *url.URL {
+	ip := net.IP
+	if ip == "" {
+		return nil
+	}
+	// Dynamic ports first (most common for services)
+	for _, p := range net.DynamicPorts {
+		if p.Value > 0 {
+			return &url.URL{Scheme: "http", Host: fmt.Sprintf("%s:%d", ip, p.Value)}
+		}
+	}
+	// Then reserved ports
+	for _, p := range net.ReservedPorts {
+		if p.Value > 0 {
+			return &url.URL{Scheme: "http", Host: fmt.Sprintf("%s:%d", ip, p.Value)}
+		}
+	}
+	return nil
+}
+
+// waitForNomadAllocation polls the Nomad API directly for a running, healthy
+// allocation and returns its address. This bypasses the Consul registration
+// pipeline entirely, eliminating the 2-8s lag between "Nomad knows it's healthy"
+// and "Consul marks it passing".
+func (s *ScaleWaker) waitForNomadAllocation(ctx context.Context, job, group string) (*url.URL, error) {
+	deadline := time.Now().Add(s.timeout)
+	logger := s.log().With("job", job, "group", group)
+
+	for {
+		if time.Now().After(deadline) {
+			return nil, waitForHealthyTimeoutError{service: job + "/" + group}
+		}
+
+		allocs, err := s.getNomadAllocations(ctx, job)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, alloc := range allocs {
+			if alloc.TaskGroup != group {
+				continue
+			}
+			if alloc.ClientStatus != "running" {
+				continue
+			}
+
+			// Check if all tasks are running
+			allTasksRunning := len(alloc.TaskStates) > 0
+			for _, ts := range alloc.TaskStates {
+				if ts.State != "running" {
+					allTasksRunning = false
+					break
+				}
+			}
+			if !allTasksRunning {
+				continue
+			}
+
+			endpoint := extractAllocEndpoint(alloc)
+			if endpoint == nil {
+				logger.Warn("allocation running but no network endpoint found", "alloc_id", alloc.ID[:8])
+				continue
+			}
+
+			// Direct HTTP health probe — don't trust metadata alone
+			if s.probeEndpointHealth(ctx, endpoint) {
+				logger.Info("nomad allocation healthy",
+					"alloc_id", alloc.ID[:8],
+					"target", endpoint.String(),
+				)
+				return endpoint, nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// probeEndpointHealth does a direct HTTP GET /healthz to verify the endpoint
+// is actually serving traffic. Timeout is short (1s) since we just need to
+// confirm the process is responsive.
+func (s *ScaleWaker) probeEndpointHealth(ctx context.Context, endpoint *url.URL) bool {
+	probeURL := fmt.Sprintf("%s/healthz", endpoint.String())
+	probeCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return false
+	}
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	return resp.StatusCode >= 200 && resp.StatusCode < 400
+}
+
+// proxyToWithRetry attempts to proxy the request. On failure, it retries once
+// through the full wake path to handle stale endpoints gracefully.
+// Retry only happens if no bytes were written to the client (safe to restart).
+func (s *ScaleWaker) proxyToWithRetry(rw http.ResponseWriter, req *http.Request, endpoint *url.URL, service, job, group string, logger *slog.Logger) bool {
+	// First attempt
+	recorder := &responseRecorder{inner: rw, statusCode: 200}
+	s.doProxy(recorder, req, endpoint, logger)
+
+	if !recorder.failed {
+		return true
+	}
+
+	// Only retry if we haven't written anything to the client yet
+	if recorder.wrote {
+		logger.WarnContext(req.Context(), "proxy failed after partial write, cannot retry",
+			"failed_target", endpoint.String(),
+		)
+		return false
+	}
+
+	// Proxy failed — retry through wake path
+	logger.WarnContext(req.Context(), "proxy failed, retrying through wake path",
+		"failed_target", endpoint.String(),
+	)
+
+	retryEndpoint, err := s.wakeUpService(req.Context(), service, job, group)
+	if err != nil {
+		logger.ErrorContext(req.Context(), "retry wake-up failed", "error", err)
+		http.Error(rw, fmt.Sprintf("retry wake up: %v", err), http.StatusServiceUnavailable)
+		return false
+	}
+
+	logger.InfoContext(req.Context(), "retry wake-up succeeded, proxying", "target", retryEndpoint.String())
+	s.proxyTo(rw, req, retryEndpoint, logger)
+	return true
+}
+
+// responseRecorder wraps http.ResponseWriter to detect proxy failures without
+// writing to the real writer. On the first attempt we buffer the proxy — if it
+// fails we can retry. This only captures the error handler path.
+type responseRecorder struct {
+	inner      http.ResponseWriter
+	statusCode int
+	failed     bool
+	wrote      bool
+}
+
+func (r *responseRecorder) Header() http.Header { return r.inner.Header() }
+func (r *responseRecorder) Write(b []byte) (int, error) {
+	r.wrote = true
+	return r.inner.Write(b)
+}
+func (r *responseRecorder) WriteHeader(code int) {
+	r.statusCode = code
+	r.inner.WriteHeader(code)
+}
+func (r *responseRecorder) Flush() {
+	if f, ok := r.inner.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// doProxy executes the reverse proxy. If the proxy's ErrorHandler fires, it
+// sets recorder.failed = true.
+func (s *ScaleWaker) doProxy(rw *responseRecorder, req *http.Request, target *url.URL, logger *slog.Logger) {
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		logger.WarnContext(r.Context(), "reverse proxy request failed", "error", err, "target", target.String())
+		rw.failed = true
+		// Don't write error to client yet — caller may retry
+	}
+	proxy.Director = func(r *http.Request) {
+		r.URL.Scheme = target.Scheme
+		r.URL.Host = target.Host
+		r.Host = target.Host
+	}
+	proxy.ServeHTTP(rw, req)
 }
 
 func (s *ScaleWaker) proxyTo(rw http.ResponseWriter, req *http.Request, target *url.URL, logger *slog.Logger) {
