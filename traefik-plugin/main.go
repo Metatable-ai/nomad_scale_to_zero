@@ -93,6 +93,8 @@ type nomadJobTaskGroup struct {
 }
 
 // nomadAllocation represents the subset of Nomad allocation fields we need.
+// The list endpoint (/v1/job/:id/allocations) returns stubs — AllocatedResources
+// may be nil or sparse. Use getNomadAllocation (singular) for full details.
 type nomadAllocation struct {
 	ID           string `json:"ID"`
 	TaskGroup    string `json:"TaskGroup"`
@@ -107,6 +109,9 @@ type nomadAllocation struct {
 		Networks []nomadAllocNetwork `json:"Networks"`
 	} `json:"Resources"`
 	AllocatedResources *struct {
+		Shared struct {
+			Networks []nomadAllocNetwork `json:"Networks"`
+		} `json:"Shared"`
 		Networks []nomadAllocNetwork `json:"Networks"`
 	} `json:"AllocatedResources"`
 }
@@ -925,17 +930,52 @@ func (s *ScaleWaker) getNomadAllocations(ctx context.Context, job string) ([]nom
 	return allocs, nil
 }
 
+// getNomadAllocation fetches the full allocation details for a single allocation.
+// Unlike the list endpoint, this returns the complete Allocation object with
+// AllocatedResources.Shared.Networks populated.
+func (s *ScaleWaker) getNomadAllocation(ctx context.Context, allocID string) (*nomadAllocation, error) {
+	endpoint := fmt.Sprintf("%s/v1/allocation/%s", s.nomadAddr, url.PathEscape(allocID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	s.addNomadToken(req)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("nomad allocation status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+
+	var alloc nomadAllocation
+	if err := json.NewDecoder(resp.Body).Decode(&alloc); err != nil {
+		return nil, err
+	}
+	return &alloc, nil
+}
+
 // extractAllocEndpoint returns the first usable address:port from a Nomad allocation.
 func extractAllocEndpoint(alloc nomadAllocation) *url.URL {
-	// Try AllocatedResources first (newer Nomad versions, requires ?resources=true)
+	// Try AllocatedResources.Shared.Networks (Nomad >= 0.9, full allocation response)
 	if alloc.AllocatedResources != nil {
+		for _, net := range alloc.AllocatedResources.Shared.Networks {
+			if u := firstPort(net); u != nil {
+				return u
+			}
+		}
+		// Some Nomad versions put Networks at the top level of AllocatedResources
 		for _, net := range alloc.AllocatedResources.Networks {
 			if u := firstPort(net); u != nil {
 				return u
 			}
 		}
 	}
-	// Fall back to Resources (legacy / always present)
+	// Fall back to Resources.Networks (legacy / always present on full alloc)
 	for _, net := range alloc.Resources.Networks {
 		if u := firstPort(net); u != nil {
 			return u
@@ -1002,7 +1042,17 @@ func (s *ScaleWaker) waitForNomadAllocation(ctx context.Context, job, group stri
 				continue
 			}
 
+			// Try extracting endpoint from the list stub first
 			endpoint := extractAllocEndpoint(alloc)
+			if endpoint == nil {
+				// List endpoint returns stubs — fetch full allocation for network info
+				fullAlloc, err := s.getNomadAllocation(ctx, alloc.ID)
+				if err != nil {
+					logger.Warn("failed to fetch full allocation", "alloc_id", alloc.ID[:8], "err", err)
+					continue
+				}
+				endpoint = extractAllocEndpoint(*fullAlloc)
+			}
 			if endpoint == nil {
 				logger.Warn("allocation running but no network endpoint found", "alloc_id", alloc.ID[:8])
 				continue

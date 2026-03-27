@@ -269,8 +269,15 @@ func startBackend(t *testing.T, body string) *backendInfo {
 }
 
 // makeAllocations creates a mock Nomad allocation response pointing at the backend.
+// This returns a "full" allocation with Resources.Networks populated,
+// as the individual /v1/allocation/:id endpoint would return.
 func makeAllocations(group, host string, port int) []nomadAllocation {
-	return []nomadAllocation{{
+	return []nomadAllocation{makeFullAllocation(group, host, port)}
+}
+
+// makeFullAllocation creates a single allocation with network info populated.
+func makeFullAllocation(group, host string, port int) nomadAllocation {
+	return nomadAllocation{
 		ID:           "alloc-test-12345678",
 		TaskGroup:    group,
 		ClientStatus: "running",
@@ -284,6 +291,19 @@ func makeAllocations(group, host string, port int) []nomadAllocation {
 				IP:           host,
 				DynamicPorts: []nomadAllocDynPort{{Label: "http", Value: port}},
 			}},
+		},
+	}
+}
+
+// makeAllocStubs creates allocation stubs without network info,
+// as the list endpoint /v1/job/:id/allocations returns in real Nomad.
+func makeAllocStubs(group string) []nomadAllocation {
+	return []nomadAllocation{{
+		ID:           "alloc-test-12345678",
+		TaskGroup:    group,
+		ClientStatus: "running",
+		TaskStates: map[string]struct{ State string `json:"State"` }{
+			"server": {State: "running"},
 		},
 	}}
 }
@@ -379,10 +399,12 @@ func TestServeHTTP_WakeUpFromZero(t *testing.T) {
 			w.Write([]byte(`{}`))
 		case strings.HasSuffix(r.URL.Path, "/allocations") && r.Method == http.MethodGet:
 			if atomic.LoadInt32(&scaled) == 1 {
-				json.NewEncoder(w).Encode(makeAllocations("main", be.host, be.port))
+				json.NewEncoder(w).Encode(makeAllocStubs("main"))
 			} else {
 				json.NewEncoder(w).Encode([]nomadAllocation{})
 			}
+		case strings.HasPrefix(r.URL.Path, "/v1/allocation/") && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(makeFullAllocation("main", be.host, be.port))
 		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
 			jobRegistered = true
 			w.Write([]byte(`{}`))
@@ -467,10 +489,12 @@ func TestServeHTTP_ConcurrentWakeupDedup(t *testing.T) {
 			w.Write([]byte(`{}`))
 		case strings.HasSuffix(r.URL.Path, "/allocations") && r.Method == http.MethodGet:
 			if atomic.LoadInt32(&scaled) == 1 {
-				json.NewEncoder(w).Encode(makeAllocations("main", be.host, be.port))
+				json.NewEncoder(w).Encode(makeAllocStubs("main"))
 			} else {
 				json.NewEncoder(w).Encode([]nomadAllocation{})
 			}
+		case strings.HasPrefix(r.URL.Path, "/v1/allocation/") && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(makeFullAllocation("main", be.host, be.port))
 		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
 			w.Write([]byte(`{}`))
 		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
@@ -658,10 +682,12 @@ func TestServeHTTP_StaleConsulEntry(t *testing.T) {
 			w.Write([]byte(`{}`))
 		case strings.HasSuffix(r.URL.Path, "/allocations") && r.Method == http.MethodGet:
 			if atomic.LoadInt32(&wakeupDone) == 1 {
-				json.NewEncoder(w).Encode(makeAllocations("main", be.host, be.port))
+				json.NewEncoder(w).Encode(makeAllocStubs("main"))
 			} else {
 				json.NewEncoder(w).Encode([]nomadAllocation{})
 			}
+		case strings.HasPrefix(r.URL.Path, "/v1/allocation/") && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(makeFullAllocation("main", be.host, be.port))
 		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
 			w.Write([]byte(`{}`))
 		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
@@ -771,10 +797,12 @@ func TestStress_ServeHTTP_Burst(t *testing.T) {
 			w.Write([]byte(`{}`))
 		case strings.HasSuffix(r.URL.Path, "/allocations") && r.Method == http.MethodGet:
 			if atomic.LoadInt32(&scaled) == 1 {
-				json.NewEncoder(w).Encode(makeAllocations("main", be.host, be.port))
+				json.NewEncoder(w).Encode(makeAllocStubs("main"))
 			} else {
 				json.NewEncoder(w).Encode([]nomadAllocation{})
 			}
+		case strings.HasPrefix(r.URL.Path, "/v1/allocation/") && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(makeFullAllocation("main", be.host, be.port))
 		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
 			w.Write([]byte(`{}`))
 		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
