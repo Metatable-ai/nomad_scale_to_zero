@@ -12,6 +12,12 @@ log:
   level: DEBUG
   format: json
 
+accessLog:
+  format: json
+  filters:
+    statusCodes:
+      - "400-599"
+
 entryPoints:
   http:
     address: ":80"

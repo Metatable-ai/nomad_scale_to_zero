@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -31,33 +31,38 @@ const (
 
 func main() {
 	var (
-		nomadAddr   = flag.String("nomad-addr", envOrDefault("NOMAD_ADDR", "http://nomad.service.consul:4646"), "Nomad API address")
-		consulAddr  = flag.String("consul-addr", envOrDefault("CONSUL_ADDR", "http://consul.service.consul:8500"), "Consul address")
-		nomadToken  = flag.String("nomad-token", envOrDefault("NOMAD_TOKEN", ""), "Nomad ACL token")
-		consulToken = flag.String("consul-token", envOrDefault("CONSUL_TOKEN", ""), "Consul ACL token")
-		redisAddr   = flag.String("redis-addr", envOrDefault("REDIS_ADDR", ""), "Redis address (optional, uses Consul if empty)")
-		redisPass   = flag.String("redis-password", envOrDefault("REDIS_PASSWORD", ""), "Redis password")
-		redisDB     = flag.Int("redis-db", envOrDefaultInt("REDIS_DB", 0), "Redis database number")
-		storeType   = flag.String("store-type", envOrDefault("STORE_TYPE", "consul"), "Store type: consul or redis")
-		interval    = flag.Duration("interval", envOrDefaultDuration("IDLE_CHECK_INTERVAL", 30*time.Second), "Idle check interval")
-		defaultTO   = flag.Duration("default-idle-timeout", envOrDefaultDuration("DEFAULT_IDLE_TIMEOUT", 5*time.Minute), "Default idle timeout")
-		purgeOnSD   = flag.Bool("purge-on-scaledown", envOrDefaultBool("PURGE_ON_SCALEDOWN", false), "Purge job on scale down when idle")
-		metricsAddr = flag.String("metrics-addr", envOrDefault("METRICS_ADDR", ""), "Observability listen address")
+		nomadAddr       = flag.String("nomad-addr", envOrDefault("NOMAD_ADDR", "http://nomad.service.consul:4646"), "Nomad API address")
+		consulAddr      = flag.String("consul-addr", envOrDefault("CONSUL_ADDR", "http://consul.service.consul:8500"), "Consul address")
+		nomadToken      = flag.String("nomad-token", envOrDefault("NOMAD_TOKEN", ""), "Nomad ACL token")
+		consulToken     = flag.String("consul-token", envOrDefault("CONSUL_TOKEN", ""), "Consul ACL token")
+		redisAddr       = flag.String("redis-addr", envOrDefault("REDIS_ADDR", ""), "Redis address (optional, uses Consul if empty)")
+		redisPass       = flag.String("redis-password", envOrDefault("REDIS_PASSWORD", ""), "Redis password")
+		redisDB         = flag.Int("redis-db", envOrDefaultInt("REDIS_DB", 0), "Redis database number")
+		storeType       = flag.String("store-type", envOrDefault("STORE_TYPE", "consul"), "Store type: consul or redis")
+		interval        = flag.Duration("interval", envOrDefaultDuration("IDLE_CHECK_INTERVAL", 30*time.Second), "Idle check interval")
+		defaultTO       = flag.Duration("default-idle-timeout", envOrDefaultDuration("DEFAULT_IDLE_TIMEOUT", 5*time.Minute), "Default idle timeout")
+		minScaleDownAge = flag.Duration("min-scale-down-age", envOrDefaultDuration("MIN_SCALE_DOWN_AGE", time.Minute), "Minimum age of an active allocation before scale down is allowed")
+		purgeOnSD       = flag.Bool("purge-on-scaledown", envOrDefaultBool("PURGE_ON_SCALEDOWN", false), "Purge job on scale down when idle")
+		metricsAddr     = flag.String("metrics-addr", envOrDefault("METRICS_ADDR", ""), "Observability listen address")
 	)
 	flag.Parse()
 
 	obs := newScalerObservability("idle-scaler")
+	logger := obs.logger
 	if err := obs.start(*metricsAddr); err != nil {
-		log.Fatalf("observability: %v", err)
+		logger.Error("observability startup failed", "error", err)
+		os.Exit(1)
 	}
 
 	nomadClient, err := nomad.NewClient(&nomad.Config{Address: *nomadAddr, SecretID: *nomadToken})
 	if err != nil {
-		log.Fatalf("nomad client: %v", err)
+		logger.Error("creating nomad client failed", "error", err, "nomad_addr", *nomadAddr)
+		os.Exit(1)
 	}
 
 	if _, err := nomadClient.Status().Leader(); err != nil {
-		log.Fatalf("nomad status: %v", err)
+		logger.Error("checking nomad leader failed", "error", err, "nomad_addr", *nomadAddr)
+		os.Exit(1)
 	}
 
 	var store activitystore.Store
@@ -66,7 +71,8 @@ func main() {
 	switch *storeType {
 	case "redis":
 		if *redisAddr == "" {
-			log.Fatalf("redis-addr is required when store-type=redis")
+			logger.Error("redis address is required when store type is redis")
+			os.Exit(1)
 		}
 		redisCfg := activitystore.RedisConfig{
 			Addr:     *redisAddr,
@@ -75,21 +81,24 @@ func main() {
 		}
 		redisStore, err := activitystore.NewRedisStore(redisCfg, activitystore.DefaultNamespace)
 		if err != nil {
-			log.Fatalf("redis activity store: %v", err)
+			logger.Error("creating redis activity store failed", "error", err, "redis_addr", *redisAddr)
+			os.Exit(1)
 		}
 		store = redisStore
 
 		redisJobStore, err := activitystore.NewRedisJobSpecStore(redisCfg, activitystore.DefaultNamespace)
 		if err != nil {
-			log.Fatalf("redis job spec store: %v", err)
+			logger.Error("creating redis job spec store failed", "error", err, "redis_addr", *redisAddr)
+			os.Exit(1)
 		}
 		jobSpecStore = redisJobStore
-		log.Printf("Using Redis backend at %s", *redisAddr)
+		logger.Info("using Redis backend", "store_type", *storeType, "redis_addr", *redisAddr)
 
 	default: // consul
 		consulStore, err := activitystore.NewConsulStoreWithToken(*consulAddr, *consulToken, activitystore.DefaultNamespace)
 		if err != nil {
-			log.Fatalf("consul activity store: %v", err)
+			logger.Error("creating consul activity store failed", "error", err, "consul_addr", *consulAddr)
+			os.Exit(1)
 		}
 		store = consulStore
 
@@ -98,94 +107,127 @@ func main() {
 		consulConfig.Token = *consulToken
 		consulClient, err := consul.NewClient(consulConfig)
 		if err != nil {
-			log.Fatalf("consul client: %v", err)
+			logger.Error("creating consul client failed", "error", err, "consul_addr", *consulAddr)
+			os.Exit(1)
 		}
 		jobSpecStore = &ConsulJobSpecStore{client: consulClient}
-		log.Printf("Using Consul backend at %s", *consulAddr)
+		logger.Info("using Consul backend", "store_type", *storeType, "consul_addr", *consulAddr)
 	}
 
 	scaler := &IdleScaler{
-		nomadClient:  nomadClient,
-		store:        store,
-		jobSpecStore: jobSpecStore,
-		interval:     *interval,
-		defaultTO:    *defaultTO,
-		purgeOnSD:    *purgeOnSD,
+		nomadClient:     nomadClient,
+		store:           store,
+		jobSpecStore:    jobSpecStore,
+		interval:        *interval,
+		defaultTO:       *defaultTO,
+		minScaleDownAge: *minScaleDownAge,
+		purgeOnSD:       *purgeOnSD,
+		obs:             obs,
+		logger:          logger,
+		now:             time.Now,
 	}
 
-	log.Printf("idle-scaler started (interval=%s, default-timeout=%s)", *interval, *defaultTO)
+	logger.Info("idle-scaler started",
+		"interval", interval.String(),
+		"default_idle_timeout", defaultTO.String(),
+		"min_scale_down_age", minScaleDownAge.String(),
+		"purge_on_scaledown", *purgeOnSD,
+		"metrics_addr", *metricsAddr,
+		"store_type", *storeType,
+	)
 	ctx := context.Background()
 	for {
 		startedAt := time.Now()
-		err := scaler.RunOnce(ctx)
-		obs.observeRun(time.Since(startedAt), err)
-		if err != nil {
-			log.Printf("run error: %v", err)
-		}
+		summary, err := scaler.RunOnce(ctx)
+		obs.observeRun(time.Since(startedAt), summary, err)
 		time.Sleep(*interval)
 	}
 }
 
 type IdleScaler struct {
-	nomadClient  *nomad.Client
-	store        activitystore.Store
-	jobSpecStore activitystore.JobSpecStore
-	interval     time.Duration
-	defaultTO    time.Duration
-	purgeOnSD    bool
+	nomadClient      *nomad.Client
+	store            activitystore.Store
+	jobSpecStore     activitystore.JobSpecStore
+	interval         time.Duration
+	defaultTO        time.Duration
+	minScaleDownAge  time.Duration
+	purgeOnSD        bool
+	obs              *scalerObservability
+	logger           *slog.Logger
+	now              func() time.Time
+	scaleGroupFn     func(jobID, group string, count int64) error
+	purgeJobFn       func(jobID string) error
+	jobAllocationsFn func(jobID string) ([]*nomad.AllocationListStub, error)
 }
 
-func (s *IdleScaler) RunOnce(ctx context.Context) error {
+func (s *IdleScaler) RunOnce(ctx context.Context) (scalerRunSummary, error) {
+	var summary scalerRunSummary
+
 	jobs, _, err := s.nomadClient.Jobs().List(nil)
 	if err != nil {
-		return fmt.Errorf("list jobs: %w", err)
+		return summary, fmt.Errorf("list jobs: %w", err)
 	}
 
 	for _, job := range jobs {
+		recordDecision(s.obs, &summary, decisionScopeJob, decisionScanned)
+
 		jobInfo, _, err := s.nomadClient.Jobs().Info(job.ID, nil)
 		if err != nil {
-			return fmt.Errorf("job info %s: %w", job.ID, err)
+			return summary, fmt.Errorf("job info %s: %w", job.ID, err)
 		}
-		if !shouldManageScaleToZeroJob(jobInfo) {
+
+		jobID, jobName := jobIdentity(jobInfo)
+		jobLogger := s.log().With("job", jobID, "job_name", jobName)
+
+		decision := scaleToZeroJobDecision(jobInfo)
+		recordDecision(s.obs, &summary, decisionScopeJob, decision)
+		if decision != decisionManaged {
+			jobLogger.DebugContext(ctx, "skipping job", "decision", decision)
 			continue
 		}
 
 		if err := s.storeJobSpec(jobInfo); err != nil {
-			log.Printf("store job spec %s: %v", job.ID, err)
+			jobLogger.WarnContext(ctx, "storing job spec failed", "error", err)
 		}
 
-		timeout := s.defaultTO
-		if raw := jobInfo.Meta[metaIdleTimeout]; raw != "" {
-			if parsed, err := time.ParseDuration(raw); err == nil {
-				timeout = parsed
-			} else if seconds, err := strconv.Atoi(raw); err == nil {
-				timeout = time.Duration(seconds) * time.Second
-			}
-		}
+		timeout := s.idleTimeoutForJob(ctx, jobInfo)
 
-		if err := s.maybeScaleToZero(ctx, jobInfo, timeout); err != nil {
-			log.Printf("scale-to-zero check %s: %v", job.ID, err)
+		if err := s.maybeScaleToZero(ctx, jobInfo, timeout, &summary); err != nil {
+			jobLogger.ErrorContext(ctx, "scale-to-zero check failed", "error", err, "idle_timeout", timeout.String())
 			continue
 		}
 	}
 
-	return nil
+	return summary, nil
+}
+
+func recordDecision(obs *scalerObservability, summary *scalerRunSummary, scope, decision string) {
+	if summary != nil {
+		summary.record(scope, decision)
+	}
+	if obs != nil {
+		obs.observeDecision(scope, decision)
+	}
 }
 
 func shouldManageScaleToZeroJob(job *nomad.Job) bool {
+	return scaleToZeroJobDecision(job) == decisionManaged
+}
+
+func scaleToZeroJobDecision(job *nomad.Job) string {
 	if job == nil || job.Meta == nil {
-		return false
+		return decisionSkippedDisabled
 	}
 
-	if strings.ToLower(job.Meta[metaEnabled]) != "true" {
-		return false
+	if !strings.EqualFold(strings.TrimSpace(job.Meta[metaEnabled]), "true") {
+		return decisionSkippedDisabled
 	}
 
 	if isProtectedScaleToZeroJob(job) {
-		return false
+		return decisionSkippedProtected
 	}
 
-	return true
+	return decisionManaged
 }
 
 func isProtectedScaleToZeroJob(job *nomad.Job) bool {
@@ -245,31 +287,29 @@ func (s *IdleScaler) storeJobSpec(job *nomad.Job) error {
 		return fmt.Errorf("store job spec %s: %w", jobID, err)
 	}
 	if changed {
-		log.Printf("job spec updated: %s", jobID)
+		s.log().Info("job spec updated", "job", jobID)
 	}
 
 	return nil
 }
 
-func (s *IdleScaler) maybeScaleToZero(ctx context.Context, job *nomad.Job, timeout time.Duration) error {
-	if !shouldManageScaleToZeroJob(job) {
-		return nil
-	}
-
-	jobID := ""
-	if job.ID != nil {
-		jobID = *job.ID
-	}
+func (s *IdleScaler) maybeScaleToZero(ctx context.Context, job *nomad.Job, timeout time.Duration, summary *scalerRunSummary) error {
+	jobID, jobName := jobIdentity(job)
 	if jobID == "" || job.TaskGroups == nil {
 		return nil
 	}
 
 	for _, group := range job.TaskGroups {
+		recordDecision(s.obs, summary, decisionScopeGroup, decisionScanned)
+
 		groupName := ""
 		if group.Name != nil {
 			groupName = *group.Name
 		}
+		jobLogger := s.log().With("job", jobID, "job_name", jobName)
 		if groupName == "" {
+			recordDecision(s.obs, summary, decisionScopeGroup, decisionSkippedMissingName)
+			jobLogger.DebugContext(ctx, "skipping group", "decision", decisionSkippedMissingName)
 			continue
 		}
 
@@ -277,40 +317,103 @@ func (s *IdleScaler) maybeScaleToZero(ctx context.Context, job *nomad.Job, timeo
 		if group.Count != nil {
 			count = *group.Count
 		}
+		groupLogger := jobLogger.With("group", groupName, "desired_count", count)
 		if count == 0 {
+			recordDecision(s.obs, summary, decisionScopeGroup, decisionSkippedZeroCount)
+			groupLogger.DebugContext(ctx, "skipping group", "decision", decisionSkippedZeroCount)
 			continue
 		}
 
 		serviceName := s.resolveServiceName(job, group)
 		if serviceName == "" {
+			recordDecision(s.obs, summary, decisionScopeGroup, decisionSkippedMissingService)
+			groupLogger.DebugContext(ctx, "skipping group", "decision", decisionSkippedMissingService)
 			continue
 		}
+
+		recordDecision(s.obs, summary, decisionScopeGroup, decisionManaged)
+		groupLogger = groupLogger.With("service", serviceName, "idle_timeout", timeout.String())
 
 		last, ok, err := s.store.LastActivity(serviceName)
 		if err != nil {
-			return err
+			recordDecision(s.obs, summary, decisionScopeGroup, decisionActivityLookupFailure)
+			return fmt.Errorf("lookup activity for service %s: %w", serviceName, err)
 		}
 
+		now := s.currentTime()
 		if !ok {
 			// No activity recorded; initialize to now to avoid immediate scale-down
-			if err := s.store.SetActivity(serviceName, time.Now()); err != nil {
+			if err := s.store.SetActivity(serviceName, now); err != nil {
+				recordDecision(s.obs, summary, decisionScopeGroup, decisionActivityInitializationFailure)
+				return fmt.Errorf("initialize activity for service %s: %w", serviceName, err)
+			}
+			recordDecision(s.obs, summary, decisionScopeGroup, decisionActivityInitialized)
+			groupLogger.InfoContext(ctx, "initialized missing activity timestamp", "decision", decisionActivityInitialized)
+			continue
+		}
+
+		idleFor := now.Sub(last)
+		if idleFor < timeout {
+			recordDecision(s.obs, summary, decisionScopeGroup, decisionSkippedRecentActivity)
+			groupLogger.DebugContext(ctx, "skipping group with recent activity",
+				"decision", decisionSkippedRecentActivity,
+				"idle_for", idleFor.String(),
+				"time_until_scale", (timeout - idleFor).String(),
+			)
+			continue
+		}
+
+		if s.minScaleDownAge > 0 {
+			activeFor, ok, err := s.youngestActiveAllocationAge(jobID, groupName, now)
+			if err != nil {
+				return fmt.Errorf("list allocations for job %s group %s: %w", jobID, groupName, err)
+			}
+			if ok && activeFor < s.minScaleDownAge {
+				recordDecision(s.obs, summary, decisionScopeGroup, decisionSkippedMinScaleDownAge)
+				groupLogger.DebugContext(ctx, "skipping group within scale-down guard window",
+					"decision", decisionSkippedMinScaleDownAge,
+					"active_for", activeFor.String(),
+					"min_scale_down_age", s.minScaleDownAge.String(),
+					"time_until_scale_eligible", (s.minScaleDownAge - activeFor).String(),
+				)
+				continue
+			}
+		}
+
+		if s.purgeOnSD {
+			recordDecision(s.obs, summary, decisionScopeGroup, decisionPurgeAttempt)
+			groupLogger.InfoContext(ctx, "purging idle job",
+				"decision", decisionPurgeAttempt,
+				"idle_for", idleFor.String(),
+			)
+			if err := s.purgeJob(jobID); err != nil {
+				recordDecision(s.obs, summary, decisionScopeGroup, decisionPurgeFailure)
 				return err
 			}
-			continue
+			recordDecision(s.obs, summary, decisionScopeGroup, decisionPurgeSuccess)
+			groupLogger.InfoContext(ctx, "purged idle job",
+				"decision", decisionPurgeSuccess,
+				"idle_for", idleFor.String(),
+			)
+			return nil
 		}
 
-		if time.Since(last) < timeout {
-			continue
-		}
-
-		log.Printf("scaling job=%s group=%s to 0 (idle %s >= %s)", jobID, groupName, time.Since(last), timeout)
-		if s.purgeOnSD {
-			log.Printf("purging job=%s (idle %s >= %s)", jobID, time.Since(last), timeout)
-			return s.purgeJob(jobID)
-		}
+		recordDecision(s.obs, summary, decisionScopeGroup, decisionScaleAttempt)
+		groupLogger.InfoContext(ctx, "scaling idle group",
+			"decision", decisionScaleAttempt,
+			"idle_for", idleFor.String(),
+			"target_count", 0,
+		)
 		if err := s.scaleGroup(jobID, groupName, 0); err != nil {
+			recordDecision(s.obs, summary, decisionScopeGroup, decisionScaleFailure)
 			return err
 		}
+		recordDecision(s.obs, summary, decisionScopeGroup, decisionScaleSuccess)
+		groupLogger.InfoContext(ctx, "scaled idle group",
+			"decision", decisionScaleSuccess,
+			"idle_for", idleFor.String(),
+			"target_count", 0,
+		)
 	}
 
 	return nil
@@ -333,7 +436,53 @@ func (s *IdleScaler) resolveServiceName(job *nomad.Job, group *nomad.TaskGroup) 
 	return ""
 }
 
+func (s *IdleScaler) youngestActiveAllocationAge(jobID, group string, now time.Time) (time.Duration, bool, error) {
+	allocations, err := s.jobAllocations(jobID)
+	if err != nil {
+		return 0, false, err
+	}
+
+	var youngest time.Duration
+	found := false
+	for _, alloc := range allocations {
+		if alloc == nil || alloc.TaskGroup != group {
+			continue
+		}
+		if alloc.DesiredStatus != "run" {
+			continue
+		}
+		if alloc.ClientStatus != "pending" && alloc.ClientStatus != "running" {
+			continue
+		}
+
+		createdAt := time.Unix(0, alloc.CreateTime)
+		age := now.Sub(createdAt)
+		if age < 0 {
+			age = 0
+		}
+		if !found || age < youngest {
+			youngest = age
+			found = true
+		}
+	}
+
+	return youngest, found, nil
+}
+
+func (s *IdleScaler) jobAllocations(jobID string) ([]*nomad.AllocationListStub, error) {
+	if s != nil && s.jobAllocationsFn != nil {
+		return s.jobAllocationsFn(jobID)
+	}
+
+	allocations, _, err := s.nomadClient.Jobs().Allocations(jobID, true, nil)
+	return allocations, err
+}
+
 func (s *IdleScaler) scaleGroup(jobID, group string, count int64) error {
+	if s != nil && s.scaleGroupFn != nil {
+		return s.scaleGroupFn(jobID, group, count)
+	}
+
 	countValue := int(count)
 	_, _, err := s.nomadClient.Jobs().Scale(jobID, group, &countValue, "scale-to-zero idle", false, nil, nil)
 	if err != nil {
@@ -344,11 +493,76 @@ func (s *IdleScaler) scaleGroup(jobID, group string, count int64) error {
 }
 
 func (s *IdleScaler) purgeJob(jobID string) error {
+	if s != nil && s.purgeJobFn != nil {
+		return s.purgeJobFn(jobID)
+	}
+
 	_, _, err := s.nomadClient.Jobs().Deregister(jobID, true, nil)
 	if err != nil {
 		return fmt.Errorf("purge job %s: %w", jobID, err)
 	}
 	return nil
+}
+
+func (s *IdleScaler) currentTime() time.Time {
+	if s != nil && s.now != nil {
+		return s.now()
+	}
+
+	return time.Now()
+}
+
+func (s *IdleScaler) log() *slog.Logger {
+	if s != nil && s.logger != nil {
+		return s.logger
+	}
+
+	return newJSONLogger("idle-scaler")
+}
+
+func (s *IdleScaler) idleTimeoutForJob(ctx context.Context, job *nomad.Job) time.Duration {
+	timeout := s.defaultTO
+	if job == nil || job.Meta == nil {
+		return timeout
+	}
+
+	raw := strings.TrimSpace(job.Meta[metaIdleTimeout])
+	if raw == "" {
+		return timeout
+	}
+
+	if parsed, err := time.ParseDuration(raw); err == nil {
+		return parsed
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil {
+		return time.Duration(seconds) * time.Second
+	}
+
+	jobID, jobName := jobIdentity(job)
+	s.log().WarnContext(ctx, "invalid idle timeout metadata, using default",
+		"job", jobID,
+		"job_name", jobName,
+		"raw_timeout", raw,
+		"default_timeout", timeout.String(),
+	)
+
+	return timeout
+}
+
+func jobIdentity(job *nomad.Job) (string, string) {
+	if job == nil {
+		return "", ""
+	}
+
+	return strings.TrimSpace(stringValue(job.ID)), strings.TrimSpace(stringValue(job.Name))
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+
+	return *value
 }
 
 func envOrDefault(key, defaultVal string) string {

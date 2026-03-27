@@ -37,6 +37,7 @@ build/
 tmp/
 temp/
 *.tmp
+.e2e-artifacts/
 
 # Logs
 *.log

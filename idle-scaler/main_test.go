@@ -6,12 +6,18 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"strconv"
 	"testing"
 	"time"
 
 	nomad "github.com/hashicorp/nomad/api"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // ---------------------------------------------------------------------------
@@ -268,6 +274,317 @@ func TestIdleTimeoutParsing_Fixed(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMaybeScaleToZero_InitializesMissingActivity(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_710_000_000, 0).UTC()
+	store := &fakeActivityStore{}
+	obs := newScalerObservability("idle-scaler-test")
+	scaler := newTestIdleScaler(store, obs, fixedNow)
+
+	var summary scalerRunSummary
+	if err := scaler.maybeScaleToZero(context.Background(), newManagedScaleToZeroJob("echo-s2z", "api", "echo-service", 1), time.Minute, &summary); err != nil {
+		t.Fatalf("maybeScaleToZero() error = %v", err)
+	}
+
+	got, ok := store.last["echo-service"]
+	if !ok {
+		t.Fatal("expected missing activity to be initialized")
+	}
+	if !got.Equal(fixedNow) {
+		t.Fatalf("initialized activity = %v, want %v", got, fixedNow)
+	}
+	if summary.groupsScanned != 1 || summary.groupsManaged != 1 {
+		t.Fatalf("summary groups = %+v, want 1 scanned and 1 managed", summary)
+	}
+	if summary.activityInitializations != 1 {
+		t.Fatalf("activityInitializations = %d, want 1", summary.activityInitializations)
+	}
+	if got := metricValue(t, obs.decisionTotal.WithLabelValues(decisionScopeGroup, decisionActivityInitialized)); got != 1 {
+		t.Fatalf("activity_initialized metric = %v, want 1", got)
+	}
+}
+
+func TestMaybeScaleToZero_RecordsRecentActivitySkip(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Unix(1_710_000_100, 0).UTC()
+	store := &fakeActivityStore{
+		last: map[string]time.Time{
+			"echo-service": fixedNow.Add(-30 * time.Second),
+		},
+	}
+	obs := newScalerObservability("idle-scaler-test")
+	scaler := newTestIdleScaler(store, obs, fixedNow)
+
+	var summary scalerRunSummary
+	if err := scaler.maybeScaleToZero(context.Background(), newManagedScaleToZeroJob("echo-s2z", "api", "echo-service", 1), time.Minute, &summary); err != nil {
+		t.Fatalf("maybeScaleToZero() error = %v", err)
+	}
+
+	if summary.recentActivitySkips != 1 {
+		t.Fatalf("recentActivitySkips = %d, want 1", summary.recentActivitySkips)
+	}
+	if summary.scaleAttempts != 0 || summary.scaleSuccesses != 0 || summary.scaleFailures != 0 {
+		t.Fatalf("unexpected scale counters in summary: %+v", summary)
+	}
+	if got := metricValue(t, obs.decisionTotal.WithLabelValues(decisionScopeGroup, decisionSkippedRecentActivity)); got != 1 {
+		t.Fatalf("skipped_recent_activity metric = %v, want 1", got)
+	}
+}
+
+func TestMaybeScaleToZero_HonorsMinimumScaleDownAge(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		allocationAge   time.Duration
+		wantScaleCalls  int
+		wantGuardSkips  int
+		wantGuardMetric float64
+		wantErr         bool
+	}{
+		{
+			name:            "fresh allocation is skipped",
+			allocationAge:   30 * time.Second,
+			wantScaleCalls:  0,
+			wantGuardSkips:  1,
+			wantGuardMetric: 1,
+		},
+		{
+			name:            "older allocation is eligible",
+			allocationAge:   2 * time.Minute,
+			wantScaleCalls:  1,
+			wantGuardSkips:  0,
+			wantGuardMetric: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixedNow := time.Unix(1_710_000_150, 0).UTC()
+			store := &fakeActivityStore{
+				last: map[string]time.Time{
+					"echo-service": fixedNow.Add(-2 * time.Minute),
+				},
+			}
+			obs := newScalerObservability("idle-scaler-test")
+			scaler := newTestIdleScaler(store, obs, fixedNow)
+			scaler.minScaleDownAge = time.Minute
+			scaler.jobAllocationsFn = func(jobID string) ([]*nomad.AllocationListStub, error) {
+				if jobID != "echo-s2z" {
+					t.Fatalf("unexpected job allocations lookup for %q", jobID)
+				}
+				return []*nomad.AllocationListStub{
+					newRunningAllocation(jobID, "api", fixedNow.Add(-tt.allocationAge)),
+				}, nil
+			}
+
+			scaleCalls := 0
+			scaler.scaleGroupFn = func(jobID, group string, count int64) error {
+				scaleCalls++
+				if jobID != "echo-s2z" || group != "api" || count != 0 {
+					t.Fatalf("unexpected scale request job=%q group=%q count=%d", jobID, group, count)
+				}
+				return nil
+			}
+
+			var summary scalerRunSummary
+			err := scaler.maybeScaleToZero(context.Background(), newManagedScaleToZeroJob("echo-s2z", "api", "echo-service", 1), time.Minute, &summary)
+			if tt.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if scaleCalls != tt.wantScaleCalls {
+				t.Fatalf("scale calls = %d, want %d", scaleCalls, tt.wantScaleCalls)
+			}
+			if summary.minScaleDownAgeSkips != tt.wantGuardSkips {
+				t.Fatalf("minScaleDownAgeSkips = %d, want %d", summary.minScaleDownAgeSkips, tt.wantGuardSkips)
+			}
+			if got := metricValue(t, obs.decisionTotal.WithLabelValues(decisionScopeGroup, decisionSkippedMinScaleDownAge)); got != tt.wantGuardMetric {
+				t.Fatalf("skipped_min_scale_down_age metric = %v, want %v", got, tt.wantGuardMetric)
+			}
+		})
+	}
+}
+
+func TestMaybeScaleToZero_RecordsScaleOutcomes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		scaleErr          error
+		wantErr           bool
+		wantScaleSuccess  int
+		wantScaleFailures int
+		failureMetric     float64
+		successMetric     float64
+	}{
+		{
+			name:              "success",
+			wantScaleSuccess:  1,
+			wantScaleFailures: 0,
+			successMetric:     1,
+		},
+		{
+			name:              "failure",
+			scaleErr:          errors.New("boom"),
+			wantErr:           true,
+			wantScaleSuccess:  0,
+			wantScaleFailures: 1,
+			failureMetric:     1,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixedNow := time.Unix(1_710_000_200, 0).UTC()
+			store := &fakeActivityStore{
+				last: map[string]time.Time{
+					"echo-service": fixedNow.Add(-2 * time.Minute),
+				},
+			}
+			obs := newScalerObservability("idle-scaler-test")
+			scaler := newTestIdleScaler(store, obs, fixedNow)
+
+			scaleCalls := 0
+			scaler.scaleGroupFn = func(jobID, group string, count int64) error {
+				scaleCalls++
+				if jobID != "echo-s2z" || group != "api" || count != 0 {
+					t.Fatalf("unexpected scale request job=%q group=%q count=%d", jobID, group, count)
+				}
+				return tt.scaleErr
+			}
+
+			var summary scalerRunSummary
+			err := scaler.maybeScaleToZero(context.Background(), newManagedScaleToZeroJob("echo-s2z", "api", "echo-service", 1), time.Minute, &summary)
+			if tt.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if scaleCalls != 1 {
+				t.Fatalf("scaleGroupFn calls = %d, want 1", scaleCalls)
+			}
+			if summary.scaleAttempts != 1 {
+				t.Fatalf("scaleAttempts = %d, want 1", summary.scaleAttempts)
+			}
+			if summary.scaleSuccesses != tt.wantScaleSuccess {
+				t.Fatalf("scaleSuccesses = %d, want %d", summary.scaleSuccesses, tt.wantScaleSuccess)
+			}
+			if summary.scaleFailures != tt.wantScaleFailures {
+				t.Fatalf("scaleFailures = %d, want %d", summary.scaleFailures, tt.wantScaleFailures)
+			}
+			if got := metricValue(t, obs.decisionTotal.WithLabelValues(decisionScopeGroup, decisionScaleAttempt)); got != 1 {
+				t.Fatalf("scale_attempt metric = %v, want 1", got)
+			}
+			if got := metricValue(t, obs.decisionTotal.WithLabelValues(decisionScopeGroup, decisionScaleSuccess)); got != tt.successMetric {
+				t.Fatalf("scale_success metric = %v, want %v", got, tt.successMetric)
+			}
+			if got := metricValue(t, obs.decisionTotal.WithLabelValues(decisionScopeGroup, decisionScaleFailure)); got != tt.failureMetric {
+				t.Fatalf("scale_failure metric = %v, want %v", got, tt.failureMetric)
+			}
+		})
+	}
+}
+
+type fakeActivityStore struct {
+	last    map[string]time.Time
+	lastErr error
+	setErr  error
+}
+
+func (s *fakeActivityStore) LastActivity(service string) (time.Time, bool, error) {
+	if s.lastErr != nil {
+		return time.Time{}, false, s.lastErr
+	}
+	if s.last == nil {
+		return time.Time{}, false, nil
+	}
+
+	at, ok := s.last[service]
+	return at, ok, nil
+}
+
+func (s *fakeActivityStore) SetActivity(service string, at time.Time) error {
+	if s.setErr != nil {
+		return s.setErr
+	}
+	if s.last == nil {
+		s.last = make(map[string]time.Time)
+	}
+	s.last[service] = at
+	return nil
+}
+
+func newTestIdleScaler(store *fakeActivityStore, obs *scalerObservability, now time.Time) *IdleScaler {
+	return &IdleScaler{
+		store:  store,
+		obs:    obs,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		now: func() time.Time {
+			return now
+		},
+	}
+}
+
+func newRunningAllocation(jobID, group string, createdAt time.Time) *nomad.AllocationListStub {
+	return &nomad.AllocationListStub{
+		JobID:         jobID,
+		TaskGroup:     group,
+		DesiredStatus: "run",
+		ClientStatus:  "running",
+		CreateTime:    createdAt.UnixNano(),
+	}
+}
+
+func newManagedScaleToZeroJob(jobID, groupName, serviceName string, count int) *nomad.Job {
+	return &nomad.Job{
+		ID:   pointerTo(jobID),
+		Name: pointerTo(jobID),
+		Type: pointerTo("service"),
+		Meta: map[string]string{
+			metaEnabled: "true",
+		},
+		TaskGroups: []*nomad.TaskGroup{
+			{
+				Name:  pointerTo(groupName),
+				Count: pointerTo(count),
+				Services: []*nomad.Service{
+					{Name: serviceName},
+				},
+			},
+		},
+	}
+}
+
+func metricValue(t *testing.T, metric prometheus.Metric) float64 {
+	t.Helper()
+
+	dtoMetric := &dto.Metric{}
+	if err := metric.Write(dtoMetric); err != nil {
+		t.Fatalf("write metric: %v", err)
+	}
+	if counter := dtoMetric.GetCounter(); counter != nil {
+		return counter.GetValue()
+	}
+	if gauge := dtoMetric.GetGauge(); gauge != nil {
+		return gauge.GetValue()
+	}
+
+	t.Fatal("unsupported metric type")
+	return 0
 }
 
 func pointerTo[T any](value T) *T {

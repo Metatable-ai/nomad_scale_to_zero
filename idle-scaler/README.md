@@ -14,6 +14,7 @@ NOMAD_ADDR=http://localhost:4646 \
 CONSUL_ADDR=http://localhost:8500 \
 IDLE_CHECK_INTERVAL=30s \
 DEFAULT_IDLE_TIMEOUT=5m \
+MIN_SCALE_DOWN_AGE=1m \
 go run .
 ```
 
@@ -41,6 +42,7 @@ go run .
 | `-store-type` / `STORE_TYPE` | `consul` | Store type: `consul` or `redis` |
 | `-interval` / `IDLE_CHECK_INTERVAL` | `30s` | Idle check interval |
 | `-default-idle-timeout` / `DEFAULT_IDLE_TIMEOUT` | `5m` | Default idle timeout |
+| `-min-scale-down-age` / `MIN_SCALE_DOWN_AGE` | `1m` | Minimum age of a running allocation before idle scale-down is allowed |
 
 ## Metadata
 
@@ -52,7 +54,7 @@ go run .
 1. Lists all Nomad jobs with `scale-to-zero.enabled=true`
 2. Stores each job spec (only if changed) for later revival by scalewaker
 3. Checks last activity timestamp from activity store
-4. If `now - lastActivity > idleTimeout` → scales job to 0
+4. If the group has been running for at least `MIN_SCALE_DOWN_AGE` and `now - lastActivity > idleTimeout` → scales job to 0
 
 ## Storage Backends
 

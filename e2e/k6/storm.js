@@ -1,6 +1,8 @@
 import http from 'k6/http';
 import { check } from 'k6';
-import { pickServiceName, requestParams, resolvedBaseUrl } from './targets.js';
+import { pickServiceName, requestParams, resolvedBaseUrl, releaseGateThresholds } from './targets.js';
+
+const { maxFailureRate, wakeP95Ms, wakeP99Ms } = releaseGateThresholds();
 
 export const options = {
   scenarios: {
@@ -16,15 +18,15 @@ export const options = {
     },
   },
   thresholds: {
-    http_req_failed: ['rate<0.05'],
-    http_req_duration: ['p(95)<45000'],
+    http_req_failed: [`rate<=${maxFailureRate}`],
+    http_req_duration: [`p(95)<=${wakeP95Ms}`, `p(99)<=${wakeP99Ms}`],
   },
 };
 
 const baseUrl = resolvedBaseUrl();
 
 export default function () {
-  const serviceName = pickServiceName(__ITER);
+  const serviceName = pickServiceName();
   const res = http.get(baseUrl, requestParams(serviceName));
 
   check(res, {

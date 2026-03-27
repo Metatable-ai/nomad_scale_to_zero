@@ -65,12 +65,23 @@ type ScaleWaker struct {
 
 	// wakeupLocks prevents multiple concurrent scale-ups for the same service
 	wakeupLocks sync.Map // map[string]*wakeupState
+
+	// endpointCache caches recently resolved endpoints to skip Consul+Nomad round-trips
+	endpointCache sync.Map // map[service]*cachedEndpoint
 }
 
 // wakeupState tracks the wake-up state for a service using a simple mutex
 type wakeupState struct {
 	mu sync.Mutex
 }
+
+// cachedEndpoint holds a recently resolved endpoint to avoid repeated Consul+Nomad lookups.
+type cachedEndpoint struct {
+	url      *url.URL
+	cachedAt time.Time
+}
+
+const endpointCacheTTL = 30 * time.Second
 
 type consulServiceEntry struct {
 	Node struct {
@@ -221,18 +232,37 @@ func (s *ScaleWaker) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Check endpoint cache first — avoids Consul+Nomad round-trips for recently woken services
+	if cached := s.getCachedEndpoint(service); cached != nil {
+		if s.probeEndpointHealth(ctx, cached) {
+			logger.InfoContext(ctx, "serving from endpoint cache", "target", cached.String())
+			if err := s.recordActivity(ctx, service); err != nil {
+				logger.WarnContext(ctx, "activity store update failed", "error", err)
+			}
+			if !s.proxyToWithRetry(rw, req, cached, service, job, group, logger) {
+				logger.ErrorContext(ctx, "proxy failed after retry (cached)")
+				s.invalidateEndpointCache(service)
+			}
+			return
+		}
+		// Cached endpoint unreachable — invalidate and fall through to normal path
+		s.invalidateEndpointCache(service)
+		logger.InfoContext(ctx, "cached endpoint unreachable, falling through", "target", cached.String())
+	}
+
 	endpoint, healthy, err := s.getHealthyEndpoint(ctx, service)
 	if err != nil {
-		logger.WarnContext(ctx, "consul health lookup failed", "error", err)
-		http.Error(rw, fmt.Sprintf("health check: %v", err), http.StatusServiceUnavailable)
-		return
+		logger.WarnContext(ctx, "consul health lookup failed, falling through to nomad-direct path", "error", err)
+		healthy = false
 	}
 
 	// If Consul says healthy, verify endpoint is actually reachable
 	// (handles stale/orphaned Consul catalog entries)
 	if healthy {
 		if !s.isEndpointReachable(endpoint) {
-			logger.WarnContext(ctx, "consul returned stale endpoint", "target", endpoint.String())
+			if endpoint != nil {
+				logger.WarnContext(ctx, "consul returned stale endpoint", "target", endpoint.String())
+			}
 			healthy = false
 		}
 	}
@@ -242,9 +272,16 @@ func (s *ScaleWaker) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if healthy {
 		count, countErr := s.getJobGroupCount(ctx, job, group)
 		if countErr == nil && count == 0 {
-			logger.WarnContext(ctx, "stale consul endpoint detected (nomad count=0)", "target", endpoint.String())
+			if endpoint != nil {
+				logger.WarnContext(ctx, "stale consul endpoint detected (nomad count=0)", "target", endpoint.String())
+			}
 			healthy = false
 		}
+	}
+
+	// Cache after Consul returns healthy and passes all stale guards
+	if healthy {
+		s.cacheEndpoint(service, endpoint)
 	}
 
 	if !healthy {
@@ -255,7 +292,13 @@ func (s *ScaleWaker) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			http.Error(rw, fmt.Sprintf("wake up: %v", err), http.StatusServiceUnavailable)
 			return
 		}
+		if endpoint == nil {
+			logger.ErrorContext(ctx, "wake returned nil endpoint without error", "service", service)
+			http.Error(rw, "internal error: nil endpoint", http.StatusServiceUnavailable)
+			return
+		}
 		logger.InfoContext(ctx, "service wake-up completed", "target", endpoint.String())
+		s.cacheEndpoint(service, endpoint)
 	}
 
 	if err := s.recordActivity(ctx, service); err != nil {
@@ -288,6 +331,33 @@ func (s *ScaleWaker) isEndpointReachable(endpoint *url.URL) bool {
 	return true
 }
 
+func (s *ScaleWaker) getCachedEndpoint(service string) *url.URL {
+	val, ok := s.endpointCache.Load(service)
+	if !ok {
+		return nil
+	}
+	ce := val.(*cachedEndpoint)
+	if time.Since(ce.cachedAt) > endpointCacheTTL {
+		s.endpointCache.Delete(service)
+		return nil
+	}
+	return ce.url
+}
+
+func (s *ScaleWaker) cacheEndpoint(service string, endpoint *url.URL) {
+	if endpoint == nil {
+		return
+	}
+	s.endpointCache.Store(service, &cachedEndpoint{
+		url:      endpoint,
+		cachedAt: time.Now(),
+	})
+}
+
+func (s *ScaleWaker) invalidateEndpointCache(service string) {
+	s.endpointCache.Delete(service)
+}
+
 // getOrCreateWakeupState returns the wakeup state for a service, creating one if needed
 func (s *ScaleWaker) getOrCreateWakeupState(service string) *wakeupState {
 	actual, _ := s.wakeupLocks.LoadOrStore(service, &wakeupState{})
@@ -303,10 +373,12 @@ func (s *ScaleWaker) wakeUpService(ctx context.Context, service, job, group stri
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
-	// Check if service became healthy AND is actually reachable
+	// Check if service became healthy while we waited for the lock.
+	// If Consul is unreachable, treat as "not healthy" and proceed with wake.
 	endpoint, healthy, err := s.getHealthyEndpoint(ctx, service)
 	if err != nil {
-		return nil, err
+		s.log().With("service", service).WarnContext(ctx, "consul health check failed in wake path, proceeding", "error", err)
+		healthy = false
 	}
 	obs := s.observabilityMetrics()
 	if healthy && s.isEndpointReachable(endpoint) {
@@ -1068,10 +1140,22 @@ func (s *ScaleWaker) waitForNomadAllocation(ctx context.Context, job, group stri
 			}
 		}
 
+		// Adaptive backoff: start fast, slow down for slower services
+		elapsed := time.Since(deadline.Add(-s.timeout))
+		var pollInterval time.Duration
+		switch {
+		case elapsed < 5*time.Second:
+			pollInterval = 500 * time.Millisecond
+		case elapsed < 15*time.Second:
+			pollInterval = 1 * time.Second
+		default:
+			pollInterval = 2 * time.Second
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(pollInterval):
 		}
 	}
 }
@@ -1113,16 +1197,25 @@ func (s *ScaleWaker) proxyToWithRetry(rw http.ResponseWriter, req *http.Request,
 
 	// Only retry if we haven't written anything to the client yet
 	if recorder.wrote {
+		target := "nil"
+		if endpoint != nil {
+			target = endpoint.String()
+		}
 		logger.WarnContext(req.Context(), "proxy failed after partial write, cannot retry",
-			"failed_target", endpoint.String(),
+			"failed_target", target,
 		)
 		return false
 	}
 
 	// Proxy failed — retry through wake path
+	target := "nil"
+	if endpoint != nil {
+		target = endpoint.String()
+	}
 	logger.WarnContext(req.Context(), "proxy failed, retrying through wake path",
-		"failed_target", endpoint.String(),
+		"failed_target", target,
 	)
+	s.invalidateEndpointCache(service)
 
 	retryEndpoint, err := s.wakeUpService(req.Context(), service, job, group)
 	if err != nil {
@@ -1131,9 +1224,14 @@ func (s *ScaleWaker) proxyToWithRetry(rw http.ResponseWriter, req *http.Request,
 		return false
 	}
 
-	logger.InfoContext(req.Context(), "retry wake-up succeeded, proxying", "target", retryEndpoint.String())
-	s.proxyTo(rw, req, retryEndpoint, logger)
-	return true
+	if retryEndpoint != nil {
+		logger.InfoContext(req.Context(), "retry wake-up succeeded, proxying", "target", retryEndpoint.String())
+		s.proxyTo(rw, req, retryEndpoint, logger)
+	} else {
+		logger.ErrorContext(req.Context(), "retry wake returned nil endpoint")
+		http.Error(rw, "internal error: nil endpoint on retry", http.StatusServiceUnavailable)
+	}
+	return retryEndpoint != nil
 }
 
 // responseRecorder wraps http.ResponseWriter to detect proxy failures without
@@ -1173,7 +1271,6 @@ func (s *ScaleWaker) doProxy(rw *responseRecorder, req *http.Request, target *ur
 	proxy.Director = func(r *http.Request) {
 		r.URL.Scheme = target.Scheme
 		r.URL.Host = target.Host
-		r.Host = target.Host
 	}
 	proxy.ServeHTTP(rw, req)
 }
@@ -1187,7 +1284,6 @@ func (s *ScaleWaker) proxyTo(rw http.ResponseWriter, req *http.Request, target *
 	proxy.Director = func(r *http.Request) {
 		r.URL.Scheme = target.Scheme
 		r.URL.Host = target.Host
-		r.Host = target.Host
 	}
 	proxy.ServeHTTP(rw, req)
 }

@@ -9,6 +9,9 @@ job "${E2E_RENDER_JOB_NAME}" {
     "scale-to-zero.enabled"      = "true"
     "scale-to-zero.idle-timeout" = "${E2E_RENDER_IDLE_TIMEOUT}"
     "scale-to-zero.job-spec-kv"  = "${E2E_RENDER_JOB_SPEC_KEY}"
+    "e2e.workload.class"         = "${E2E_RENDER_WORKLOAD_CLASS}"
+    "e2e.workload.ordinal"       = "${E2E_RENDER_WORKLOAD_ORDINAL}"
+    "e2e.workload.dependency"    = "${E2E_RENDER_DEPENDENCY_HOST}"
   }
 
   group "main" {
@@ -27,7 +30,17 @@ job "${E2E_RENDER_JOB_NAME}" {
       }
 
       env {
-        E2E_ECHO_TEXT = "Hello from ${E2E_RENDER_SERVICE_NAME}"
+        E2E_ECHO_SERVICE_NAME       = "${E2E_RENDER_SERVICE_NAME}"
+        E2E_ECHO_WORKLOAD_CLASS     = "${E2E_RENDER_WORKLOAD_CLASS}"
+        E2E_ECHO_WORKLOAD_ORDINAL   = "${E2E_RENDER_WORKLOAD_ORDINAL}"
+        E2E_ECHO_TEXT               = "${E2E_RENDER_RESPONSE_TEXT}"
+        E2E_ECHO_RESPONSE_MODE      = "${E2E_RENDER_RESPONSE_MODE}"
+        E2E_ECHO_STARTUP_DELAY      = "${E2E_RENDER_STARTUP_DELAY}"
+        E2E_ECHO_HEALTH_MODE        = "${E2E_RENDER_HEALTH_MODE}"
+        E2E_ECHO_IDLE_TIMEOUT       = "${E2E_RENDER_IDLE_TIMEOUT}"
+        E2E_ECHO_DEPENDENCY_URL     = "${E2E_RENDER_DEPENDENCY_URL}"
+        E2E_ECHO_DEPENDENCY_HOST    = "${E2E_RENDER_DEPENDENCY_HOST}"
+        E2E_ECHO_DEPENDENCY_TIMEOUT = "${E2E_RENDER_DEPENDENCY_TIMEOUT}"
       }
 
       resources {
@@ -48,6 +61,7 @@ job "${E2E_RENDER_JOB_NAME}" {
           "traefik.http.middlewares.scalewaker-${E2E_RENDER_SERVICE_NAME}.plugin.scalewaker.serviceName=${E2E_RENDER_SERVICE_NAME}",
           "traefik.http.middlewares.scalewaker-${E2E_RENDER_SERVICE_NAME}.plugin.scalewaker.timeout=45s",
           "traefik.http.routers.${E2E_RENDER_SERVICE_NAME}.middlewares=scalewaker-${E2E_RENDER_SERVICE_NAME}",
+          "e2e.workload.class=${E2E_RENDER_WORKLOAD_CLASS}",
         ]
 
         check {

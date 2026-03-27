@@ -25,6 +25,9 @@ services:
       dockerfile: Dockerfile.test
     entrypoint: ["./run-stress-tests.sh"]
     environment:
+      STRESS_RUN_ID: "${STRESS_RUN_ID:-}"
+      STRESS_AUTOMATION_JOB_NAME: "${STRESS_AUTOMATION_JOB_NAME:-store-pressure}"
+      STRESS_ARTIFACTS_DIR: "${STRESS_CONTAINER_ARTIFACTS_DIR:-/artifacts}"
       TEST_REDIS_ADDR: "redis:6379"
       TEST_REDIS_PASSWORD: ""
       TEST_CONSUL_ADDR: "http://consul:8500"
@@ -35,6 +38,8 @@ services:
       STRESS_JOB_KEYS: "${STRESS_JOB_KEYS:-1000}"
       STRESS_JOB_SPEC_SIZE: "${STRESS_JOB_SPEC_SIZE:-32768}"
       STRESS_GO_TEST_TIMEOUT: "${STRESS_GO_TEST_TIMEOUT:-20m}"
+    volumes:
+      - ${STRESS_HOST_ARTIFACTS_DIR:-./.e2e-artifacts/store-pressure/manual}:${STRESS_CONTAINER_ARTIFACTS_DIR:-/artifacts}
     depends_on:
       redis:
         condition: service_healthy

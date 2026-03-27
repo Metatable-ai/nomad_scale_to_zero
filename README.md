@@ -66,6 +66,20 @@ curl -H 'Host: echo-s2z.localhost' http://localhost/
 
 **See [LOCAL_TESTING.md](LOCAL_TESTING.md) for detailed development setup and testing guide.**
 
+## 🤖 Automation jobs
+
+Use the dedicated automation wrappers when you want stable evidence-collection entrypoints instead of the generic runners:
+
+- `./run-automation-smoke.sh` — fast smoke profile on the minimal topology
+- `./run-automation-prod-profile.sh` — certification / production-shaped profile for readiness evidence
+- `./run-automation-soak.sh` — extended mixed-traffic soak on the certification topology
+- `./run-automation-resilience.sh` — dead-job revival and idle-scaler restart recovery focus
+- `./run-automation-store-pressure.sh` — Docker stress suites for Redis / Consul store pressure
+- `./run-automation-release-gate.sh` — certification-profile release gate that fails on release-gate no-go results
+- `./run-automation-certification.sh` — alias of the prod-profile automation job
+
+These wrappers still honor the existing `E2E_*` and `STRESS_*` overrides, but they default artifacts to `.e2e-artifacts/<job>/<run-id>/` so runs stay grouped by purpose. Readiness or `/metadata` validation failures now also write per-service bundles under `failures/<service>/<reason>/` with targeted Nomad and Consul evidence. For post-wake diagnosis on the Nomad-managed scaler path, set `E2E_TARGET_IDLE_SCALER_ISOLATION_MODE=stop-after-initial-scale-to-zero` so the harness completes the first scale-to-zero pass, then removes `idle-scaler` and skips later scaler-dependent cleanup phases on purpose. Set `AUTOMATION_PRESET_ONLY=1` to print the resolved preset without starting Docker.
+
 ## 💡 Use Cases
 
 Scale-to-zero is perfect for:
@@ -97,6 +111,14 @@ Traditional auto-scaling typically scales to a minimum of 1 instance, which stil
    - it waits for the service to become **healthy in Consul** (bounded by a timeout)
 4. It records activity (last request timestamp) in the configured activity store.
 5. The request is proxied to the now-running backend.
+
+When Traefik's Prometheus endpoint is enabled, ScaleWaker also emits bounded wake-path metrics:
+
+- `s2z_traefik_plugin_wake_attempts_total`
+- `s2z_traefik_plugin_wake_outcomes_total{result=...}`
+- `s2z_traefik_plugin_wake_duration_seconds{result=...}`
+
+These metrics intentionally avoid per-service labels; use the structured plugin logs for service/job detail.
 
 ### Background path (scale-down)
 
@@ -302,6 +324,8 @@ The policies used by the local ACL script live in `local-test/nomad/`:
 - **`traefik-plugin/`** — ScaleWaker Traefik middleware plugin (Go)
 - **`idle-scaler/`** — Idle scaler agent (Go)
 - **`activity-store/`** — Shared store abstraction (Consul KV / Redis)
+- **`e2e/`** — Docker end-to-end harness, reusable topology/workload profiles, and Nomad job templates
+  - `e2e/profiles/` — Named `smoke` and `certification` targets that select Docker e2e topology size, workload expectations, scenario sets, and whether idle-scaler stays as a compose debug service or runs as a Nomad system job
 - **`local-test/`** — Local development configs and sample jobs
   - `local-test/scripts/start-local-with-acl.sh` — One-shot local demo with ACLs
   - `local-test/traefik/` — Dynamic Traefik config (fallback router/middleware)

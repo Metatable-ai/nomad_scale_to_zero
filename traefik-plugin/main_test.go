@@ -913,3 +913,599 @@ func TestStress_ServeHTTP_ActivityNonBlocking(t *testing.T) {
 			rec.Code, rec.Body.String())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Architecture fix tests
+// ---------------------------------------------------------------------------
+
+func TestServeHTTP_EndpointCache_HitOnSecondRequest(t *testing.T) {
+	// Backend that responds to both normal requests and /healthz probe
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+			return
+		}
+		w.Write([]byte("cached OK"))
+	}))
+	defer be.Close()
+
+	u, _ := url.Parse(be.URL)
+	host, portStr, _ := net.SplitHostPort(u.Host)
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	entries := []consulServiceEntry{{}}
+	entries[0].Node.Address = host
+	entries[0].Service.Address = host
+	entries[0].Service.Port = port
+
+	var consulHealthCalls atomic.Int32
+
+	consul := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/health/service/"):
+			consulHealthCalls.Add(1)
+			w.Header().Set("X-Consul-Index", "1")
+			json.NewEncoder(w).Encode(entries)
+		case strings.HasPrefix(r.URL.Path, "/v1/kv/"):
+			if r.Method == http.MethodPut {
+				w.Write([]byte("true"))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer consul.Close()
+
+	nomad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
+			json.NewEncoder(w).Encode(nomadJobInfo{
+				Status:     "running",
+				TaskGroups: []nomadJobTaskGroup{{Name: "main", Count: 1}},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer nomad.Close()
+
+	sw := &ScaleWaker{
+		next:          http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next called") }),
+		config:        &Config{ServiceName: "cache-svc", JobName: "cache-job", GroupName: "main"},
+		service:       "cache-svc",
+		jobName:       "cache-job",
+		group:         "main",
+		consulAddr:    consul.URL,
+		nomadAddr:     nomad.URL,
+		activityStore: "consul",
+		jobSpecStore:  "consul",
+		client:        &http.Client{Timeout: 5 * time.Second},
+		timeout:       10 * time.Second,
+		logger:        newPluginLogger("test"),
+		observability: defaultWakeObservabilityInstance(),
+	}
+
+	// First request — populates cache via Consul
+	rec1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest("GET", "/hello", nil)
+	req1.Host = "cache-svc.localhost"
+	sw.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first request: status = %d, want 200; body: %s", rec1.Code, rec1.Body.String())
+	}
+
+	countAfterFirst := consulHealthCalls.Load()
+	if countAfterFirst == 0 {
+		t.Fatal("first request should have called Consul health endpoint")
+	}
+
+	// Second request — should be served from endpoint cache (no additional Consul health call)
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest("GET", "/hello", nil)
+	req2.Host = "cache-svc.localhost"
+	sw.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second request: status = %d, want 200; body: %s", rec2.Code, rec2.Body.String())
+	}
+
+	countAfterSecond := consulHealthCalls.Load()
+	if countAfterSecond != countAfterFirst {
+		t.Errorf("consul health calls: after first=%d, after second=%d; expected no additional call (cache hit)",
+			countAfterFirst, countAfterSecond)
+	}
+}
+
+func TestServeHTTP_EndpointCache_InvalidateOnUnreachable(t *testing.T) {
+	// First backend — will be closed after first request to simulate unreachable
+	be1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+			return
+		}
+		w.Write([]byte("first backend"))
+	}))
+
+	u1, _ := url.Parse(be1.URL)
+	host1, portStr1, _ := net.SplitHostPort(u1.Host)
+	var port1 int
+	fmt.Sscanf(portStr1, "%d", &port1)
+
+	entries1 := []consulServiceEntry{{}}
+	entries1[0].Node.Address = host1
+	entries1[0].Service.Address = host1
+	entries1[0].Service.Port = port1
+
+	// Second backend — takes over after be1 goes down
+	be2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+			return
+		}
+		w.Write([]byte("second backend"))
+	}))
+	defer be2.Close()
+
+	u2, _ := url.Parse(be2.URL)
+	host2, portStr2, _ := net.SplitHostPort(u2.Host)
+	var port2 int
+	fmt.Sscanf(portStr2, "%d", &port2)
+
+	entries2 := []consulServiceEntry{{}}
+	entries2[0].Node.Address = host2
+	entries2[0].Service.Address = host2
+	entries2[0].Service.Port = port2
+
+	var be1Closed atomic.Int32
+
+	consul := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/health/service/"):
+			w.Header().Set("X-Consul-Index", "1")
+			if be1Closed.Load() == 1 {
+				json.NewEncoder(w).Encode(entries2)
+			} else {
+				json.NewEncoder(w).Encode(entries1)
+			}
+		case strings.HasPrefix(r.URL.Path, "/v1/kv/"):
+			if r.Method == http.MethodPut {
+				w.Write([]byte("true"))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer consul.Close()
+
+	nomad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
+			json.NewEncoder(w).Encode(nomadJobInfo{
+				Status:     "running",
+				TaskGroups: []nomadJobTaskGroup{{Name: "main", Count: 1}},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer nomad.Close()
+
+	sw := &ScaleWaker{
+		next:          http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next called") }),
+		config:        &Config{ServiceName: "inval-svc", JobName: "inval-job", GroupName: "main"},
+		service:       "inval-svc",
+		jobName:       "inval-job",
+		group:         "main",
+		consulAddr:    consul.URL,
+		nomadAddr:     nomad.URL,
+		activityStore: "consul",
+		jobSpecStore:  "consul",
+		client:        &http.Client{Timeout: 5 * time.Second},
+		timeout:       10 * time.Second,
+		logger:        newPluginLogger("test"),
+		observability: defaultWakeObservabilityInstance(),
+	}
+
+	// First request — caches be1 endpoint
+	rec1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest("GET", "/", nil)
+	req1.Host = "inval-svc.localhost"
+	sw.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first request: status = %d, want 200", rec1.Code)
+	}
+	if rec1.Body.String() != "first backend" {
+		t.Fatalf("first request: body = %q, want %q", rec1.Body.String(), "first backend")
+	}
+
+	// Close first backend → cached endpoint becomes unreachable
+	be1.Close()
+	be1Closed.Store(1)
+
+	// Second request — cache probe fails → invalidate → fall through to Consul → get be2
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest("GET", "/", nil)
+	req2.Host = "inval-svc.localhost"
+	sw.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second request: status = %d, want 200; body: %s", rec2.Code, rec2.Body.String())
+	}
+	if rec2.Body.String() != "second backend" {
+		t.Errorf("second request: body = %q, want %q (should have fallen through to new backend)",
+			rec2.Body.String(), "second backend")
+	}
+}
+
+func TestServeHTTP_NilEndpointAfterWake(t *testing.T) {
+	// Consul returns no healthy entries → triggers wake path.
+	// Nomad returns allocations but with NO network info → waitForNomadAllocation returns nil → 503.
+	consul := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/health/service/"):
+			if r.URL.Query().Get("wait") != "" {
+				time.Sleep(100 * time.Millisecond)
+			}
+			w.Header().Set("X-Consul-Index", "1")
+			json.NewEncoder(w).Encode([]consulServiceEntry{})
+		case strings.HasPrefix(r.URL.Path, "/v1/kv/"):
+			if r.Method == http.MethodPut {
+				w.Write([]byte("true"))
+				return
+			}
+			w.Write([]byte(`{"ID":"nil-job","Name":"nil-job"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer consul.Close()
+
+	nomad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/scale") && r.Method == http.MethodPost:
+			w.Write([]byte(`{}`))
+		case strings.HasSuffix(r.URL.Path, "/allocations") && r.Method == http.MethodGet:
+			// Return running allocation stubs with no network info
+			json.NewEncoder(w).Encode(makeAllocStubs("main"))
+		case strings.HasPrefix(r.URL.Path, "/v1/allocation/") && r.Method == http.MethodGet:
+			// Full allocation also has NO network info
+			json.NewEncoder(w).Encode(nomadAllocation{
+				ID:           "alloc-nil-12345678",
+				TaskGroup:    "main",
+				ClientStatus: "running",
+				TaskStates: map[string]struct{ State string `json:"State"` }{
+					"server": {State: "running"},
+				},
+				// Resources.Networks is empty — no endpoint extractable
+			})
+		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
+			w.Write([]byte(`{}`))
+		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
+			json.NewEncoder(w).Encode(nomadJobInfo{
+				Status:     "dead",
+				TaskGroups: []nomadJobTaskGroup{{Name: "main", Count: 0}},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer nomad.Close()
+
+	sw := &ScaleWaker{
+		next:          http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+		config:        &Config{ServiceName: "nil-svc", JobName: "nil-job", GroupName: "main"},
+		service:       "nil-svc",
+		jobName:       "nil-job",
+		group:         "main",
+		consulAddr:    consul.URL,
+		nomadAddr:     nomad.URL,
+		activityStore: "consul",
+		jobSpecStore:  "consul",
+		client:        &http.Client{Timeout: 5 * time.Second},
+		timeout:       1 * time.Second, // Short timeout for fast test
+		logger:        newPluginLogger("test"),
+		observability: defaultWakeObservabilityInstance(),
+	}
+
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "nil-svc.localhost"
+	sw.ServeHTTP(rec, req)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (nil endpoint after wake); body: %s", rec.Code, rec.Body.String())
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("took %v, expected ~1s timeout", elapsed)
+	}
+}
+
+func TestServeHTTP_ConsulErrorFallthrough(t *testing.T) {
+	// Consul health returns 500, but Nomad-direct wake path should still succeed.
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+			return
+		}
+		w.Write([]byte("consul-error-ok"))
+	}))
+	defer be.Close()
+
+	u, _ := url.Parse(be.URL)
+	beHost, portStr, _ := net.SplitHostPort(u.Host)
+	var bePort int
+	fmt.Sscanf(portStr, "%d", &bePort)
+
+	var scaled int32
+
+	consul := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/health/service/"):
+			// Consul health always fails with 500
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("consul internal error"))
+		case strings.HasPrefix(r.URL.Path, "/v1/kv/"):
+			if r.Method == http.MethodPut {
+				w.Write([]byte("true"))
+				return
+			}
+			// GET job spec — this still works
+			w.Write([]byte(`{"ID":"cerr-job","Name":"cerr-job"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer consul.Close()
+
+	nomad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/scale") && r.Method == http.MethodPost:
+			atomic.StoreInt32(&scaled, 1)
+			w.Write([]byte(`{}`))
+		case strings.HasSuffix(r.URL.Path, "/allocations") && r.Method == http.MethodGet:
+			if atomic.LoadInt32(&scaled) == 1 {
+				json.NewEncoder(w).Encode(makeAllocStubs("main"))
+			} else {
+				json.NewEncoder(w).Encode([]nomadAllocation{})
+			}
+		case strings.HasPrefix(r.URL.Path, "/v1/allocation/") && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(makeFullAllocation("main", beHost, bePort))
+		case r.URL.Path == "/v1/jobs" && r.Method == http.MethodPost:
+			w.Write([]byte(`{}`))
+		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
+			count := 0
+			if atomic.LoadInt32(&scaled) == 1 {
+				count = 1
+			}
+			json.NewEncoder(w).Encode(nomadJobInfo{
+				Status:     "dead",
+				TaskGroups: []nomadJobTaskGroup{{Name: "main", Count: count}},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer nomad.Close()
+
+	sw := &ScaleWaker{
+		next:          http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+		config:        &Config{ServiceName: "cerr-svc", JobName: "cerr-job", GroupName: "main"},
+		service:       "cerr-svc",
+		jobName:       "cerr-job",
+		group:         "main",
+		consulAddr:    consul.URL,
+		nomadAddr:     nomad.URL,
+		activityStore: "consul",
+		jobSpecStore:  "consul",
+		client:        &http.Client{Timeout: 5 * time.Second},
+		timeout:       10 * time.Second,
+		logger:        newPluginLogger("test"),
+		observability: defaultWakeObservabilityInstance(),
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "cerr-svc.localhost"
+	sw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (Consul error should fall through to Nomad wake); body: %s",
+			rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != "consul-error-ok" {
+		t.Errorf("body = %q, want %q", rec.Body.String(), "consul-error-ok")
+	}
+}
+
+func TestProxyPreservesHostHeader(t *testing.T) {
+	// Backend captures the incoming Host header.
+	var capturedHost atomic.Value
+
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedHost.Store(r.Host)
+		w.Write([]byte("host-ok"))
+	}))
+	defer be.Close()
+
+	u, _ := url.Parse(be.URL)
+	beHost, portStr, _ := net.SplitHostPort(u.Host)
+	var bePort int
+	fmt.Sscanf(portStr, "%d", &bePort)
+
+	entries := []consulServiceEntry{{}}
+	entries[0].Node.Address = beHost
+	entries[0].Service.Address = beHost
+	entries[0].Service.Port = bePort
+
+	consul := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/health/service/"):
+			w.Header().Set("X-Consul-Index", "1")
+			json.NewEncoder(w).Encode(entries)
+		case strings.HasPrefix(r.URL.Path, "/v1/kv/"):
+			if r.Method == http.MethodPut {
+				w.Write([]byte("true"))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer consul.Close()
+
+	nomad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/job/"):
+			json.NewEncoder(w).Encode(nomadJobInfo{
+				Status:     "running",
+				TaskGroups: []nomadJobTaskGroup{{Name: "main", Count: 1}},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer nomad.Close()
+
+	sw := &ScaleWaker{
+		next:          http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next called") }),
+		config:        &Config{ServiceName: "host-svc", JobName: "host-job", GroupName: "main"},
+		service:       "host-svc",
+		jobName:       "host-job",
+		group:         "main",
+		consulAddr:    consul.URL,
+		nomadAddr:     nomad.URL,
+		activityStore: "consul",
+		jobSpecStore:  "consul",
+		client:        &http.Client{Timeout: 5 * time.Second},
+		timeout:       10 * time.Second,
+		logger:        newPluginLogger("test"),
+		observability: defaultWakeObservabilityInstance(),
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/data", nil)
+	req.Host = "custom-service.example.com"
+	sw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	got, ok := capturedHost.Load().(string)
+	if !ok || got == "" {
+		t.Fatal("backend did not capture Host header")
+	}
+	if got != "custom-service.example.com" {
+		t.Errorf("backend received Host = %q, want %q", got, "custom-service.example.com")
+	}
+}
+
+func TestWaitForNomadAllocation_AdaptiveBackoff(t *testing.T) {
+	// Backend that serves /healthz for the probe check
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer be.Close()
+
+	u, _ := url.Parse(be.URL)
+	beHost, portStr, _ := net.SplitHostPort(u.Host)
+	var bePort int
+	fmt.Sscanf(portStr, "%d", &bePort)
+
+	var callCount atomic.Int32
+	var callTimes []time.Time
+	var mu sync.Mutex
+
+	// Return empty allocations for first 6 calls, then return healthy allocation
+	const emptyCallsBeforeHealthy = 6
+
+	nomad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/allocations") && r.Method == http.MethodGet:
+			n := callCount.Add(1)
+			mu.Lock()
+			callTimes = append(callTimes, time.Now())
+			mu.Unlock()
+
+			if int(n) <= emptyCallsBeforeHealthy {
+				json.NewEncoder(w).Encode([]nomadAllocation{})
+			} else {
+				json.NewEncoder(w).Encode(makeAllocStubs("main"))
+			}
+		case strings.HasPrefix(r.URL.Path, "/v1/allocation/") && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(makeFullAllocation("main", beHost, bePort))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer nomad.Close()
+
+	sw := &ScaleWaker{
+		next:          http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+		config:        &Config{ServiceName: "backoff-svc", JobName: "backoff-job", GroupName: "main"},
+		service:       "backoff-svc",
+		jobName:       "backoff-job",
+		group:         "main",
+		nomadAddr:     nomad.URL,
+		client:        &http.Client{Timeout: 5 * time.Second},
+		timeout:       30 * time.Second,
+		logger:        newPluginLogger("test"),
+		observability: defaultWakeObservabilityInstance(),
+	}
+
+	endpoint, err := sw.waitForNomadAllocation(context.Background(), "backoff-job", "main")
+	if err != nil {
+		t.Fatalf("waitForNomadAllocation returned error: %v", err)
+	}
+	if endpoint == nil {
+		t.Fatal("waitForNomadAllocation returned nil endpoint")
+	}
+
+	mu.Lock()
+	times := make([]time.Time, len(callTimes))
+	copy(times, callTimes)
+	mu.Unlock()
+
+	if len(times) < 3 {
+		t.Fatalf("expected at least 3 allocation calls, got %d", len(times))
+	}
+
+	// Verify intervals increase with adaptive backoff.
+	// First intervals (elapsed < 5s) should be ~500ms.
+	// Later intervals (elapsed 5-15s) should be ~1000ms.
+	t.Logf("allocation call timestamps (%d calls):", len(times))
+	for i := 1; i < len(times); i++ {
+		interval := times[i].Sub(times[i-1])
+		t.Logf("  call %d→%d: %v", i, i+1, interval)
+	}
+
+	// Check first interval is in the fast range (~500ms ± 200ms)
+	firstInterval := times[1].Sub(times[0])
+	if firstInterval < 300*time.Millisecond || firstInterval > 700*time.Millisecond {
+		t.Errorf("first poll interval = %v, want ~500ms (±200ms)", firstInterval)
+	}
+
+	// If we have enough calls, check that later intervals are longer
+	if len(times) >= 4 {
+		lastEmptyInterval := times[len(times)-2].Sub(times[len(times)-3])
+		if lastEmptyInterval < firstInterval-200*time.Millisecond {
+			t.Errorf("later interval (%v) should be >= first interval (%v); backoff not working",
+				lastEmptyInterval, firstInterval)
+		}
+	}
+}

@@ -1,18 +1,25 @@
 # Copyright 2026 Metatable Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+name      = "${NOMAD_NODE_NAME}"
 data_dir  = "/tmp/nomad"
 bind_addr = "0.0.0.0"
 
 advertise {
-  http = "nomad-server"
-  rpc  = "nomad-server"
-  serf = "nomad-server"
+  http = "${NOMAD_NODE_NAME}"
+  rpc  = "${NOMAD_NODE_NAME}"
+  serf = "${NOMAD_NODE_NAME}"
 }
 
 server {
   enabled          = true
-  bootstrap_expect = 1
+  bootstrap_expect = ${E2E_TARGET_NOMAD_SERVERS}
+}
+
+server_join {
+  retry_join     = [${NOMAD_SERVER_JOIN}]
+  retry_max      = 0
+  retry_interval = "5s"
 }
 
 acl {
