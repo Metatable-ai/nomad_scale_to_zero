@@ -15,16 +15,26 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 const (
-	readyEndpointTTL   = 30 * time.Second
-	wakePollInterval   = 250 * time.Millisecond
-	probeRequestTTL    = 1 * time.Second
-	releaseWakeLockTTL = 5 * time.Second
+	readyEndpointTTL         = 30 * time.Second
+	activationFailureTTL     = 10 * time.Second
+	wakePollInterval         = 250 * time.Millisecond
+	probeRequestTTL          = 1 * time.Second
+	releaseWakeLockTTL       = 5 * time.Second
+	activationStateOpTimeout = 5 * time.Second
 )
 
 var errActivationTimeout = errors.New("timeout waiting for backend activation")
+
+const (
+	activationStatusPending = "pending"
+	activationStatusReady   = "ready"
+	activationStatusFailed  = "failed"
+)
 
 type requestRuntime interface {
 	Activate(ctx context.Context, workload WorkloadRegistration) (*url.URL, error)
@@ -96,11 +106,13 @@ type nomadRuntime struct {
 	logger         *slog.Logger
 	store          stateStore
 	client         *http.Client
+	inflight       singleflight.Group
 	nomadAddr      string
 	consulAddr     string
 	nomadToken     string
 	consulToken    string
 	requestTimeout time.Duration
+	activationTTL  time.Duration
 	probePath      string
 }
 
@@ -118,6 +130,7 @@ func newNomadRuntime(logger *slog.Logger, store stateStore, cfg Config) *nomadRu
 		nomadToken:     strings.TrimSpace(cfg.NomadToken),
 		consulToken:    strings.TrimSpace(cfg.ConsulToken),
 		requestTimeout: cfg.RequestTimeout,
+		activationTTL:  cfg.ActivationTTL,
 		probePath:      normalizeProbePath(cfg.ProbePath),
 	}
 }
@@ -130,36 +143,140 @@ func (r *nomadRuntime) Activate(ctx context.Context, workload WorkloadRegistrati
 		"group_name", workload.GroupName,
 	)
 
+	if endpoint, ok, err := r.lookupReadyEndpoint(ctx, workload); err != nil {
+		logger.WarnContext(ctx, "ready endpoint lookup failed", "error", err)
+	} else if ok {
+		return cloneURL(endpoint), nil
+	}
+
+	if endpoint, ok, err := r.lookupActivationReadyEndpoint(ctx, workload, logger); err != nil {
+		logger.WarnContext(ctx, "activation state lookup failed", "error", err)
+	} else if ok {
+		r.cacheReadyEndpoint(ctx, workload, endpoint, logger)
+		return cloneURL(endpoint), nil
+	}
+
+	if err := r.startActivation(ctx, workload, logger); err != nil {
+		return nil, err
+	}
+
+	endpoint, err := r.waitForActivation(ctx, workload, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	return cloneURL(endpoint), nil
+}
+
+func (r *nomadRuntime) startActivation(ctx context.Context, workload WorkloadRegistration, logger *slog.Logger) error {
+	_, err, _ := r.inflight.Do(workload.HostName, func() (interface{}, error) {
+		if endpoint, ok, err := r.lookupActivationReadyEndpoint(ctx, workload, logger); err != nil {
+			logger.WarnContext(ctx, "activation state lookup failed before activation start", "error", err)
+		} else if ok {
+			r.cacheReadyEndpoint(ctx, workload, endpoint, logger)
+			return nil, nil
+		}
+
+		if state, ok, err := r.store.GetActivationState(ctx, workload.HostName); err != nil {
+			logger.WarnContext(ctx, "activation state lookup failed before wake lock acquisition", "error", err)
+		} else if ok && state.Status == activationStatusPending {
+			return nil, nil
+		}
+
+		startCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), activationStateOpTimeout)
+		defer cancel()
+
+		owner := fmt.Sprintf("%s-%d", workload.HostName, time.Now().UnixNano())
+		acquired, err := r.store.AcquireWakeLock(startCtx, workload.HostName, owner, r.wakeLockTTL())
+		if err != nil {
+			return nil, fmt.Errorf("acquire wake lock: %w", err)
+		}
+		if !acquired {
+			return nil, nil
+		}
+
+		state := ActivationState{
+			Status: activationStatusPending,
+			Owner:  owner,
+		}
+		if err := r.store.SetActivationState(startCtx, workload.HostName, state, r.wakeLockTTL()); err != nil {
+			_ = r.store.ReleaseWakeLock(startCtx, workload.HostName, owner)
+			return nil, fmt.Errorf("set activation pending: %w", err)
+		}
+
+		go r.runActivation(ctx, workload, owner, logger)
+		return nil, nil
+	})
+	return err
+}
+
+func (r *nomadRuntime) runActivation(ctx context.Context, workload WorkloadRegistration, owner string, logger *slog.Logger) {
+	activationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.activationTTL)
+	defer cancel()
+
+	endpoint, err := r.performWake(activationCtx, workload, logger)
+	state := ActivationState{
+		Status: activationStatusFailed,
+		Owner:  owner,
+	}
+	stateTTL := activationFailureTTL
+	if err != nil {
+		state.Error = err.Error()
+		logger.WarnContext(activationCtx, "backend activation failed", "error", err)
+	} else if endpoint != nil {
+		state.Status = activationStatusReady
+		state.Endpoint = endpoint.String()
+		stateTTL = readyEndpointTTL
+		logger.InfoContext(activationCtx, "backend activation ready", "target", endpoint.String())
+	}
+
+	stateCtx, stateCancel := context.WithTimeout(context.Background(), activationStateOpTimeout)
+	defer stateCancel()
+	if stateErr := r.store.SetActivationState(stateCtx, workload.HostName, state, stateTTL); stateErr != nil {
+		logger.Warn("publish activation result failed", "error", stateErr)
+	}
+
+	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), releaseWakeLockTTL)
+	defer releaseCancel()
+	if releaseErr := r.store.ReleaseWakeLock(releaseCtx, workload.HostName, owner); releaseErr != nil {
+		logger.Warn("release wake lock failed", "error", releaseErr)
+	}
+}
+
+func (r *nomadRuntime) waitForActivation(ctx context.Context, workload WorkloadRegistration, logger *slog.Logger) (*url.URL, error) {
+	ticker := time.NewTicker(wakePollInterval)
+	defer ticker.Stop()
+
 	for {
 		if endpoint, ok, err := r.lookupReadyEndpoint(ctx, workload); err != nil {
-			logger.WarnContext(ctx, "ready endpoint lookup failed", "error", err)
+			logger.WarnContext(ctx, "ready endpoint lookup failed while waiting for activation", "error", err)
 		} else if ok {
 			return endpoint, nil
 		}
 
-		if endpoint, healthy, err := r.resolveHealthyEndpoint(ctx, workload); err != nil {
-			logger.WarnContext(ctx, "consul health check failed in activator wake path", "error", err)
-		} else if healthy {
-			r.cacheReadyEndpoint(ctx, workload, endpoint, logger)
-			return endpoint, nil
-		}
-
-		owner := fmt.Sprintf("%s-%d", workload.HostName, time.Now().UnixNano())
-		acquired, err := r.store.AcquireWakeLock(ctx, workload.HostName, owner, r.wakeLockTTL())
+		state, ok, err := r.store.GetActivationState(ctx, workload.HostName)
 		if err != nil {
-			return nil, fmt.Errorf("acquire wake lock: %w", err)
-		}
-
-		if acquired {
-			defer func() {
-				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), releaseWakeLockTTL)
-				defer releaseCancel()
-				if err := r.store.ReleaseWakeLock(releaseCtx, workload.HostName, owner); err != nil {
-					logger.Warn("release wake lock failed", "error", err)
+			logger.WarnContext(ctx, "activation state lookup failed while waiting", "error", err)
+		} else if ok {
+			switch state.Status {
+			case activationStatusReady:
+				endpoint, ready, parseErr := state.ReadyEndpoint()
+				if parseErr != nil {
+					logger.WarnContext(ctx, "activation state ready endpoint parse failed", "error", parseErr)
+					return nil, parseErr
 				}
-			}()
-
-			return r.performWake(ctx, workload, logger)
+				if ready {
+					r.cacheReadyEndpoint(ctx, workload, endpoint, logger)
+					return endpoint, nil
+				}
+			case activationStatusFailed:
+				if state.Error == "" {
+					return nil, errors.New("activation failed")
+				}
+				return nil, errors.New(state.Error)
+			}
+		} else if err := r.startActivation(ctx, workload, logger); err != nil {
+			return nil, err
 		}
 
 		select {
@@ -168,9 +285,31 @@ func (r *nomadRuntime) Activate(ctx context.Context, workload WorkloadRegistrati
 				return nil, waitForActivationTimeoutError{service: workload.ServiceName}
 			}
 			return nil, ctx.Err()
-		case <-time.After(wakePollInterval):
+		case <-ticker.C:
 		}
 	}
+}
+
+func (r *nomadRuntime) lookupActivationReadyEndpoint(ctx context.Context, workload WorkloadRegistration, logger *slog.Logger) (*url.URL, bool, error) {
+	state, ok, err := r.store.GetActivationState(ctx, workload.HostName)
+	if err != nil || !ok || state.Status != activationStatusReady {
+		return nil, false, err
+	}
+
+	endpoint, ready, err := state.ReadyEndpoint()
+	if err != nil || !ready {
+		return nil, false, err
+	}
+	if !r.probeEndpointHealth(ctx, endpoint) {
+		clearCtx, cancel := context.WithTimeout(context.Background(), activationStateOpTimeout)
+		defer cancel()
+		if clearErr := r.store.ClearActivationState(clearCtx, workload.HostName); clearErr != nil {
+			logger.Warn("clear stale activation state failed", "error", clearErr)
+		}
+		return nil, false, nil
+	}
+
+	return endpoint, true, nil
 }
 
 func (r *nomadRuntime) performWake(ctx context.Context, workload WorkloadRegistration, logger *slog.Logger) (*url.URL, error) {
@@ -227,7 +366,7 @@ func (r *nomadRuntime) cacheReadyEndpoint(ctx context.Context, workload Workload
 }
 
 func (r *nomadRuntime) wakeLockTTL() time.Duration {
-	return r.requestTimeout + 15*time.Second
+	return r.activationTTL + 15*time.Second
 }
 
 func (r *nomadRuntime) resolveHealthyEndpoint(ctx context.Context, workload WorkloadRegistration) (*url.URL, bool, error) {
@@ -514,12 +653,17 @@ func (r *nomadRuntime) getNomadAllocation(ctx context.Context, allocID string) (
 }
 
 func (r *nomadRuntime) waitForNomadAllocation(ctx context.Context, job, group string) (*url.URL, error) {
-	deadline := time.Now().Add(r.requestTimeout)
+	startedAt := time.Now()
 	logger := r.logger.With("job", job, "group", group)
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 
 	for {
-		if time.Now().After(deadline) {
-			return nil, waitForActivationTimeoutError{service: job + "/" + group}
+		if err := ctx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, waitForActivationTimeoutError{service: job + "/" + group}
+			}
+			return nil, err
 		}
 
 		allocs, err := r.getNomadAllocations(ctx, job)
@@ -562,7 +706,7 @@ func (r *nomadRuntime) waitForNomadAllocation(ctx context.Context, job, group st
 			}
 		}
 
-		elapsed := time.Since(deadline.Add(-r.requestTimeout))
+		elapsed := time.Since(startedAt)
 		var pollInterval time.Duration
 		switch {
 		case elapsed < 5*time.Second:
@@ -573,13 +717,21 @@ func (r *nomadRuntime) waitForNomadAllocation(ctx context.Context, job, group st
 			pollInterval = 2 * time.Second
 		}
 
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(pollInterval)
+
 		select {
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				return nil, waitForActivationTimeoutError{service: job + "/" + group}
 			}
 			return nil, ctx.Err()
-		case <-time.After(pollInterval):
+		case <-timer.C:
 		}
 	}
 }
@@ -665,6 +817,14 @@ func shortAllocID(allocID string) string {
 		return allocID
 	}
 	return allocID[:8]
+}
+
+func cloneURL(raw *url.URL) *url.URL {
+	if raw == nil {
+		return nil
+	}
+	cloned := *raw
+	return &cloned
 }
 
 func (r *nomadRuntime) addNomadToken(req *http.Request) {

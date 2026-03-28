@@ -226,6 +226,37 @@ services:
       REDIS_DB: "0"
       ACTIVATOR_ADDR: ":8090"
       ACTIVATOR_REQUEST_TIMEOUT: "${E2E_REQUEST_TIMEOUT:-45s}"
+      ACTIVATOR_ACTIVATION_TIMEOUT: "${E2E_ACTIVATOR_ACTIVATION_TIMEOUT:-}"
+      LOG_LEVEL: info
+      E2E_BOOTSTRAP_DIR: /bootstrap
+    expose:
+      - "8090"
+    volumes:
+      - bootstrap-state:/bootstrap:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8090/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      redis:
+        condition: service_healthy
+      nomad-acl-bootstrap:
+        condition: service_completed_successfully
+
+  activator-2:
+    <<: *e2e-service
+    entrypoint:
+      - /app/e2e/scripts/start-activator.sh
+    environment:
+      NOMAD_ADDR: http://nomad-server:4646
+      CONSUL_ADDR: http://consul:8500
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+      ACTIVATOR_ADDR: ":8090"
+      ACTIVATOR_REQUEST_TIMEOUT: "${E2E_REQUEST_TIMEOUT:-45s}"
+      ACTIVATOR_ACTIVATION_TIMEOUT: "${E2E_ACTIVATOR_ACTIVATION_TIMEOUT:-}"
       LOG_LEVEL: info
       E2E_BOOTSTRAP_DIR: /bootstrap
     expose:

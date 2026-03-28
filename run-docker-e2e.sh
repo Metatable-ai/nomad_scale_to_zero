@@ -264,6 +264,7 @@ case "$E2E_TARGET_IDLE_SCALER_PLACEMENT" in
 esac
 if [ "$E2E_ENABLE_ACTIVATOR_SERVICE" = "true" ]; then
 	append_monitored_service activator
+	append_monitored_service activator-2
 fi
 append_service e2e-runner
 

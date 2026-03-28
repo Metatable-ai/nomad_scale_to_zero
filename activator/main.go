@@ -25,6 +25,7 @@ import (
 const (
 	defaultListenAddr     = ":8090"
 	defaultRequestTimeout = 45 * time.Second
+	defaultActivationTTL  = 90 * time.Second
 	redisPingTimeout      = 5 * time.Second
 	readyzPingTimeout     = 2 * time.Second
 )
@@ -39,6 +40,7 @@ type Config struct {
 	NomadToken     string
 	ConsulToken    string
 	RequestTimeout time.Duration
+	ActivationTTL  time.Duration
 	ProbePath      string
 }
 
@@ -383,6 +385,7 @@ func main() {
 		"consul_addr", cfg.ConsulAddr,
 		"probe_path", cfg.ProbePath,
 		"request_timeout", cfg.RequestTimeout.String(),
+		"activation_timeout", cfg.ActivationTTL.String(),
 	)
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -428,7 +431,13 @@ func loadConfig() (Config, error) {
 	consulToken := flag.String("consul-token", envOrDefault("CONSUL_TOKEN", envOrDefault("S2Z_CONSUL_TOKEN", "")), "Consul ACL token")
 	probePath := flag.String("probe-path", envOrDefault("ACTIVATOR_PROBE_PATH", "/healthz"), "Backend readiness probe path")
 	requestTimeout := flag.Duration("request-timeout", envOrDefaultDuration("ACTIVATOR_REQUEST_TIMEOUT", defaultRequestTimeout), "Maximum time to hold the first request while a backend wakes")
+	activationTimeout := flag.Duration("activation-timeout", envOrDefaultDuration("ACTIVATOR_ACTIVATION_TIMEOUT", 0), "Maximum time a backend activation may continue after the first request times out")
 	flag.Parse()
+
+	resolvedActivationTTL := *activationTimeout
+	if resolvedActivationTTL <= 0 {
+		resolvedActivationTTL = defaultActivationTTLForRequest(*requestTimeout)
+	}
 
 	cfg = Config{
 		ListenAddr:     strings.TrimSpace(*listenAddr),
@@ -440,6 +449,7 @@ func loadConfig() (Config, error) {
 		NomadToken:     strings.TrimSpace(*nomadToken),
 		ConsulToken:    strings.TrimSpace(*consulToken),
 		RequestTimeout: *requestTimeout,
+		ActivationTTL:  resolvedActivationTTL,
 		ProbePath:      normalizeProbePath(*probePath),
 	}
 
@@ -458,8 +468,23 @@ func loadConfig() (Config, error) {
 	if cfg.RequestTimeout <= 0 {
 		return Config{}, errors.New("request timeout must be greater than zero")
 	}
+	if cfg.ActivationTTL < cfg.RequestTimeout {
+		return Config{}, errors.New("activation timeout must be greater than or equal to request timeout")
+	}
 
 	return cfg, nil
+}
+
+func defaultActivationTTLForRequest(requestTimeout time.Duration) time.Duration {
+	if requestTimeout <= 0 {
+		return defaultActivationTTL
+	}
+
+	activationTTL := requestTimeout + 45*time.Second
+	if activationTTL < defaultActivationTTL {
+		return defaultActivationTTL
+	}
+	return activationTTL
 }
 
 func writeText(w http.ResponseWriter, status int, body string) {

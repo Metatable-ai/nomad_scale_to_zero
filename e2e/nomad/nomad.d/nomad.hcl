@@ -13,6 +13,9 @@ advertise {
 server {
   enabled          = true
   bootstrap_expect = 1
+  default_scheduler_config {
+    scheduler_algorithm = "spread"
+  }
 }
 
 acl {

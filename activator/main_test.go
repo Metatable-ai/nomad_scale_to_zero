@@ -13,26 +13,33 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 type fakeStateStore struct {
-	err            error
-	calls          int
-	workloads      map[string]WorkloadRegistration
-	synced         []WorkloadRegistration
-	removed        int
-	readyEndpoints map[string]*url.URL
-	activities     []string
+	mu               sync.Mutex
+	err              error
+	calls            int
+	workloads        map[string]WorkloadRegistration
+	synced           []WorkloadRegistration
+	removed          int
+	readyEndpoints   map[string]*url.URL
+	activationStates map[string]ActivationState
+	activities       []string
 }
 
 func (f *fakeStateStore) Ping(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	return f.err
 }
 
 func (f *fakeStateStore) LookupWorkload(_ context.Context, host string) (WorkloadRegistration, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return WorkloadRegistration{}, false, f.err
 	}
@@ -41,6 +48,8 @@ func (f *fakeStateStore) LookupWorkload(_ context.Context, host string) (Workloa
 }
 
 func (f *fakeStateStore) SyncWorkloads(_ context.Context, workloads []WorkloadRegistration) (RegistrySyncResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return RegistrySyncResult{}, f.err
 	}
@@ -55,6 +64,8 @@ func (f *fakeStateStore) SyncWorkloads(_ context.Context, workloads []WorkloadRe
 }
 
 func (f *fakeStateStore) LookupReadyEndpoint(_ context.Context, host string) (*url.URL, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return nil, false, f.err
 	}
@@ -63,6 +74,8 @@ func (f *fakeStateStore) LookupReadyEndpoint(_ context.Context, host string) (*u
 }
 
 func (f *fakeStateStore) SetReadyEndpoint(_ context.Context, host string, endpoint *url.URL, _ time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}
@@ -74,6 +87,8 @@ func (f *fakeStateStore) SetReadyEndpoint(_ context.Context, host string, endpoi
 }
 
 func (f *fakeStateStore) ClearReadyEndpoint(_ context.Context, host string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}
@@ -81,19 +96,63 @@ func (f *fakeStateStore) ClearReadyEndpoint(_ context.Context, host string) erro
 	return nil
 }
 
+func (f *fakeStateStore) GetActivationState(_ context.Context, host string) (ActivationState, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return ActivationState{}, false, f.err
+	}
+	state, ok := f.activationStates[normalizeHost(host)]
+	return state, ok, nil
+}
+
+func (f *fakeStateStore) SetActivationState(_ context.Context, host string, state ActivationState, _ time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if f.activationStates == nil {
+		f.activationStates = make(map[string]ActivationState)
+	}
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = time.Now().UTC()
+	}
+	f.activationStates[normalizeHost(host)] = state
+	return nil
+}
+
+func (f *fakeStateStore) ClearActivationState(_ context.Context, host string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	delete(f.activationStates, normalizeHost(host))
+	return nil
+}
+
 func (f *fakeStateStore) AcquireWakeLock(context.Context, string, string, time.Duration) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return true, f.err
 }
 
 func (f *fakeStateStore) ReleaseWakeLock(context.Context, string, string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.err
 }
 
 func (f *fakeStateStore) GetJobSpec(context.Context, string) ([]byte, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return nil, false, f.err
 }
 
 func (f *fakeStateStore) SetActivity(_ context.Context, service string, _ time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}

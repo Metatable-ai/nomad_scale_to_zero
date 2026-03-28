@@ -14,5 +14,10 @@ http:
     s2z-activator:
       loadBalancer:
         passHostHeader: true
+        healthCheck:
+          path: /readyz
+          interval: 5s
+          timeout: 2s
         servers:
           - url: "http://activator:8090"
+          - url: "http://activator-2:8090"

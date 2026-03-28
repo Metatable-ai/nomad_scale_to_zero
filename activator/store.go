@@ -15,12 +15,13 @@ import (
 )
 
 const (
-	registryNamespacePrefix = "scale-to-zero/registry"
-	registryHostsSetKey     = registryNamespacePrefix + "/hosts"
-	registryHostKeyPrefix   = registryNamespacePrefix + "/hosts/"
-	readyEndpointKeyPrefix  = registryNamespacePrefix + "/ready-endpoints/"
-	wakeLockKeyPrefix       = registryNamespacePrefix + "/wake-locks/"
-	activityKeyPrefix       = "scale-to-zero/activity/"
+	registryNamespacePrefix  = "scale-to-zero/registry"
+	registryHostsSetKey      = registryNamespacePrefix + "/hosts"
+	registryHostKeyPrefix    = registryNamespacePrefix + "/hosts/"
+	readyEndpointKeyPrefix   = registryNamespacePrefix + "/ready-endpoints/"
+	activationStateKeyPrefix = registryNamespacePrefix + "/activations/"
+	wakeLockKeyPrefix        = registryNamespacePrefix + "/wake-locks/"
+	activityKeyPrefix        = "scale-to-zero/activity/"
 )
 
 var releaseWakeLockScript = redis.NewScript(`
@@ -35,6 +36,25 @@ type RegistrySyncResult struct {
 	RemovedCount int
 }
 
+type ActivationState struct {
+	Status    string    `json:"status"`
+	Owner     string    `json:"owner,omitempty"`
+	Endpoint  string    `json:"endpoint,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (s ActivationState) ReadyEndpoint() (*url.URL, bool, error) {
+	if s.Endpoint == "" {
+		return nil, false, nil
+	}
+	parsed, err := url.Parse(s.Endpoint)
+	if err != nil {
+		return nil, false, fmt.Errorf("parse activation endpoint: %w", err)
+	}
+	return parsed, true, nil
+}
+
 type stateStore interface {
 	Ping(ctx context.Context) error
 	LookupWorkload(ctx context.Context, host string) (WorkloadRegistration, bool, error)
@@ -42,6 +62,9 @@ type stateStore interface {
 	LookupReadyEndpoint(ctx context.Context, host string) (*url.URL, bool, error)
 	SetReadyEndpoint(ctx context.Context, host string, endpoint *url.URL, ttl time.Duration) error
 	ClearReadyEndpoint(ctx context.Context, host string) error
+	GetActivationState(ctx context.Context, host string) (ActivationState, bool, error)
+	SetActivationState(ctx context.Context, host string, state ActivationState, ttl time.Duration) error
+	ClearActivationState(ctx context.Context, host string) error
 	AcquireWakeLock(ctx context.Context, host, owner string, ttl time.Duration) (bool, error)
 	ReleaseWakeLock(ctx context.Context, host, owner string) error
 	GetJobSpec(ctx context.Context, key string) ([]byte, bool, error)
@@ -132,6 +155,7 @@ func (s *redisStateStore) SyncWorkloads(ctx context.Context, workloads []Workloa
 
 		pipe.Del(ctx, registryHostKey(currentHost))
 		pipe.Del(ctx, readyEndpointKey(currentHost))
+		pipe.Del(ctx, activationStateKey(currentHost))
 		pipe.Del(ctx, wakeLockKey(currentHost))
 		pipe.SRem(ctx, registryHostsSetKey, currentHost)
 		removedCount++
@@ -189,6 +213,60 @@ func (s *redisStateStore) ClearReadyEndpoint(ctx context.Context, host string) e
 	}
 
 	return s.client.Del(ctx, readyEndpointKey(host)).Err()
+}
+
+func (s *redisStateStore) GetActivationState(ctx context.Context, host string) (ActivationState, bool, error) {
+	if s == nil || s.client == nil {
+		return ActivationState{}, false, errors.New("redis client is not configured")
+	}
+
+	raw, err := s.client.Get(ctx, activationStateKey(host)).Bytes()
+	switch {
+	case err == nil:
+	case errors.Is(err, redis.Nil):
+		return ActivationState{}, false, nil
+	default:
+		return ActivationState{}, false, fmt.Errorf("lookup activation state %s: %w", host, err)
+	}
+
+	var state ActivationState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return ActivationState{}, false, fmt.Errorf("decode activation state %s: %w", host, err)
+	}
+
+	return state, true, nil
+}
+
+func (s *redisStateStore) SetActivationState(ctx context.Context, host string, state ActivationState, ttl time.Duration) error {
+	if s == nil || s.client == nil {
+		return errors.New("redis client is not configured")
+	}
+	if ttl <= 0 {
+		return errors.New("activation state ttl must be greater than zero")
+	}
+	if state.Status == "" {
+		return errors.New("activation state status is required")
+	}
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = time.Now().UTC()
+	} else {
+		state.UpdatedAt = state.UpdatedAt.UTC()
+	}
+
+	payload, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("encode activation state %s: %w", host, err)
+	}
+
+	return s.client.Set(ctx, activationStateKey(host), payload, ttl).Err()
+}
+
+func (s *redisStateStore) ClearActivationState(ctx context.Context, host string) error {
+	if s == nil || s.client == nil {
+		return errors.New("redis client is not configured")
+	}
+
+	return s.client.Del(ctx, activationStateKey(host)).Err()
 }
 
 func (s *redisStateStore) AcquireWakeLock(ctx context.Context, host, owner string, ttl time.Duration) (bool, error) {
@@ -263,6 +341,10 @@ func readyEndpointKey(host string) string {
 
 func wakeLockKey(host string) string {
 	return wakeLockKeyPrefix + normalizeHost(host)
+}
+
+func activationStateKey(host string) string {
+	return activationStateKeyPrefix + normalizeHost(host)
 }
 
 func activityKey(service string) string {

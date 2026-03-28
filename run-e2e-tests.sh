@@ -932,13 +932,46 @@ capture_current_consul_cleanup_state() {
 	set_consul_cleanup_state_from_json "$catalog_json" "$checks_json"
 }
 
+idle_scaler_nomad_job_running() {
+	[ "$IDLE_SCALER_PLACEMENT" = "nomad-system-job" ] || return 1
+
+	allocations_json="$(nomad_get "/v1/job/idle-scaler-e2e/allocations" 2>/dev/null || true)"
+	[ -n "$allocations_json" ] || return 1
+
+	running_count="$(printf '%s' "$allocations_json" | jq -r '[.[] | select(.ClientStatus == "running")] | length')"
+	[ "$running_count" -eq "$IDLE_SCALER_EXPECTED_RUNNING" ]
+}
+
 consul_workloads_drained() {
 	[ -z "$CURRENT_WORKLOAD_SERVICES" ] && [ -z "$CURRENT_WORKLOAD_CHECKS" ]
 }
 
 consul_nonworkload_matches_baseline() {
-	[ "$CURRENT_NONWORKLOAD_SERVICES_JSON" = "$CONSUL_BASELINE_SERVICE_NAMES_JSON" ] \
-		&& [ "$CURRENT_NONWORKLOAD_CHECK_COUNTS_JSON" = "$CONSUL_BASELINE_CHECK_COUNTS_JSON" ]
+	if [ "$CURRENT_NONWORKLOAD_SERVICES_JSON" = "$CONSUL_BASELINE_SERVICE_NAMES_JSON" ] \
+		&& [ "$CURRENT_NONWORKLOAD_CHECK_COUNTS_JSON" = "$CONSUL_BASELINE_CHECK_COUNTS_JSON" ]; then
+		return 0
+	fi
+
+	if [ "$IDLE_SCALER_PLACEMENT" != "nomad-system-job" ]; then
+		return 1
+	fi
+
+	if ! printf '%s' "$CURRENT_NONWORKLOAD_SERVICES_JSON" | jq -e 'index("idle-scaler") == null' >/dev/null; then
+		return 1
+	fi
+
+	if ! printf '%s' "$CURRENT_NONWORKLOAD_CHECK_COUNTS_JSON" | jq -e 'all(.[]; .service != "idle-scaler")' >/dev/null; then
+		return 1
+	fi
+
+	baseline_services_without_idle_scaler="$(printf '%s' "$CONSUL_BASELINE_SERVICE_NAMES_JSON" | jq -c '[.[] | select(. != "idle-scaler")]')"
+	current_services_without_idle_scaler="$(printf '%s' "$CURRENT_NONWORKLOAD_SERVICES_JSON" | jq -c '[.[] | select(. != "idle-scaler")]')"
+	baseline_check_counts_without_idle_scaler="$(printf '%s' "$CONSUL_BASELINE_CHECK_COUNTS_JSON" | jq -c '[.[] | select(.service != "idle-scaler")]')"
+	current_check_counts_without_idle_scaler="$(printf '%s' "$CURRENT_NONWORKLOAD_CHECK_COUNTS_JSON" | jq -c '[.[] | select(.service != "idle-scaler")]')"
+
+	[ "$current_services_without_idle_scaler" = "$baseline_services_without_idle_scaler" ] \
+		&& [ "$current_check_counts_without_idle_scaler" = "$baseline_check_counts_without_idle_scaler" ] \
+		&& idle_scaler_nomad_job_running
 }
 
 load_consul_cleanup_state_from_snapshot() {
