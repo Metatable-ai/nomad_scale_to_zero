@@ -23,11 +23,19 @@ const (
 	wakeLockKeyPrefix        = registryNamespacePrefix + "/wake-locks/"
 	activityKeyPrefix        = "scale-to-zero/activity/"
 	milestoneChannelPrefix   = "scale-to-zero/events/"
+	leaderLockKey            = "scale-to-zero/leader"
 )
 
 var releaseWakeLockScript = redis.NewScript(`
 if redis.call("GET", KEYS[1]) == ARGV[1] then
 	return redis.call("DEL", KEYS[1])
+end
+return 0
+`)
+
+var renewLeaderLockScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("PEXPIRE", KEYS[1], ARGV[2])
 end
 return 0
 `)
@@ -70,6 +78,11 @@ type stateStore interface {
 	ReleaseWakeLock(ctx context.Context, host, owner string) error
 	GetJobSpec(ctx context.Context, key string) ([]byte, bool, error)
 	SetActivity(ctx context.Context, service string, at time.Time) error
+	GetActivity(ctx context.Context, service string) (time.Time, bool, error)
+	ListRegisteredHosts(ctx context.Context) ([]string, error)
+	AcquireLeaderLock(ctx context.Context, owner string, ttl time.Duration) (bool, error)
+	RenewLeaderLock(ctx context.Context, owner string, ttl time.Duration) (bool, error)
+	ReleaseLeaderLock(ctx context.Context, owner string) error
 	PublishMilestone(ctx context.Context, host string, status string) error
 	SubscribeMilestones(ctx context.Context, host string) (<-chan string, func(), error)
 }
@@ -332,6 +345,76 @@ func (s *redisStateStore) SetActivity(ctx context.Context, service string, at ti
 	}
 
 	return s.client.Set(ctx, activityKey(service), at.UTC().Format(time.RFC3339Nano), 0).Err()
+}
+
+func (s *redisStateStore) GetActivity(ctx context.Context, service string) (time.Time, bool, error) {
+	if s == nil || s.client == nil {
+		return time.Time{}, false, errors.New("redis client is not configured")
+	}
+	service = normalizeHost(service)
+	if service == "" {
+		return time.Time{}, false, nil
+	}
+
+	raw, err := s.client.Get(ctx, activityKey(service)).Result()
+	switch {
+	case err == nil:
+	case errors.Is(err, redis.Nil):
+		return time.Time{}, false, nil
+	default:
+		return time.Time{}, false, fmt.Errorf("get activity %s: %w", service, err)
+	}
+
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("parse activity timestamp %s: %w", service, err)
+	}
+	return t, true, nil
+}
+
+func (s *redisStateStore) ListRegisteredHosts(ctx context.Context) ([]string, error) {
+	if s == nil || s.client == nil {
+		return nil, errors.New("redis client is not configured")
+	}
+
+	hosts, err := s.client.SMembers(ctx, registryHostsSetKey).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("list registered hosts: %w", err)
+	}
+	return hosts, nil
+}
+
+func (s *redisStateStore) AcquireLeaderLock(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
+	if s == nil || s.client == nil {
+		return false, errors.New("redis client is not configured")
+	}
+	acquired, err := s.client.SetNX(ctx, leaderLockKey, owner, ttl).Result()
+	if err != nil {
+		return false, fmt.Errorf("acquire leader lock: %w", err)
+	}
+	return acquired, nil
+}
+
+func (s *redisStateStore) RenewLeaderLock(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
+	if s == nil || s.client == nil {
+		return false, errors.New("redis client is not configured")
+	}
+	ms := int64(ttl / time.Millisecond)
+	result, err := renewLeaderLockScript.Run(ctx, s.client, []string{leaderLockKey}, owner, ms).Int64()
+	if err != nil {
+		return false, fmt.Errorf("renew leader lock: %w", err)
+	}
+	return result == 1, nil
+}
+
+func (s *redisStateStore) ReleaseLeaderLock(ctx context.Context, owner string) error {
+	if s == nil || s.client == nil {
+		return errors.New("redis client is not configured")
+	}
+	if err := releaseWakeLockScript.Run(ctx, s.client, []string{leaderLockKey}, owner).Err(); err != nil {
+		return fmt.Errorf("release leader lock: %w", err)
+	}
+	return nil
 }
 
 func (s *redisStateStore) PublishMilestone(ctx context.Context, host string, status string) error {

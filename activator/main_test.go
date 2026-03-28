@@ -28,8 +28,10 @@ type fakeStateStore struct {
 	readyEndpoints   map[string]*url.URL
 	activationStates map[string]ActivationState
 	activities       []string
+	activityTimes    map[string]time.Time
 	milestones       []string
 	milestoneSubs    map[string][]chan string
+	leaderOwner      string
 }
 
 func (f *fakeStateStore) Ping(context.Context) error {
@@ -152,13 +154,74 @@ func (f *fakeStateStore) GetJobSpec(context.Context, string) ([]byte, bool, erro
 	return nil, false, f.err
 }
 
-func (f *fakeStateStore) SetActivity(_ context.Context, service string, _ time.Time) error {
+func (f *fakeStateStore) SetActivity(_ context.Context, service string, at time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}
 	f.activities = append(f.activities, service)
+	if f.activityTimes == nil {
+		f.activityTimes = make(map[string]time.Time)
+	}
+	f.activityTimes[normalizeHost(service)] = at
+	return nil
+}
+
+func (f *fakeStateStore) GetActivity(_ context.Context, service string) (time.Time, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return time.Time{}, false, f.err
+	}
+	t, ok := f.activityTimes[normalizeHost(service)]
+	return t, ok, nil
+}
+
+func (f *fakeStateStore) ListRegisteredHosts(context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	hosts := make([]string, 0, len(f.workloads))
+	for h := range f.workloads {
+		hosts = append(hosts, h)
+	}
+	return hosts, nil
+}
+
+func (f *fakeStateStore) AcquireLeaderLock(_ context.Context, owner string, _ time.Duration) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return false, f.err
+	}
+	if f.leaderOwner == "" {
+		f.leaderOwner = owner
+		return true, nil
+	}
+	return f.leaderOwner == owner, nil
+}
+
+func (f *fakeStateStore) RenewLeaderLock(_ context.Context, owner string, _ time.Duration) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.leaderOwner == owner, nil
+}
+
+func (f *fakeStateStore) ReleaseLeaderLock(_ context.Context, owner string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if f.leaderOwner == owner {
+		f.leaderOwner = ""
+	}
 	return nil
 }
 

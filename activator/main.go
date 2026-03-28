@@ -31,17 +31,18 @@ const (
 )
 
 type Config struct {
-	ListenAddr     string
-	RedisAddr      string
-	RedisPassword  string
-	RedisDB        int
-	NomadAddr      string
-	ConsulAddr     string
-	NomadToken     string
-	ConsulToken    string
-	RequestTimeout time.Duration
-	ActivationTTL  time.Duration
-	ProbePath      string
+	ListenAddr      string
+	RedisAddr       string
+	RedisPassword   string
+	RedisDB         int
+	NomadAddr       string
+	ConsulAddr      string
+	NomadToken      string
+	ConsulToken     string
+	RequestTimeout  time.Duration
+	ActivationTTL   time.Duration
+	ProbePath       string
+	ScaleDownEnable bool
 }
 
 type Activator struct {
@@ -396,10 +397,17 @@ func main() {
 		"probe_path", cfg.ProbePath,
 		"request_timeout", cfg.RequestTimeout.String(),
 		"activation_timeout", cfg.ActivationTTL.String(),
+		"scale_down_enabled", cfg.ScaleDownEnable,
 	)
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Start scale-down controller if enabled.
+	if cfg.ScaleDownEnable {
+		scaler := newScaleDownController(logger, store, cfg.NomadAddr, cfg.NomadToken)
+		go scaler.Run(shutdownCtx)
+	}
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -442,6 +450,7 @@ func loadConfig() (Config, error) {
 	probePath := flag.String("probe-path", envOrDefault("ACTIVATOR_PROBE_PATH", "/healthz"), "Backend readiness probe path")
 	requestTimeout := flag.Duration("request-timeout", envOrDefaultDuration("ACTIVATOR_REQUEST_TIMEOUT", defaultRequestTimeout), "Maximum time to hold the first request while a backend wakes")
 	activationTimeout := flag.Duration("activation-timeout", envOrDefaultDuration("ACTIVATOR_ACTIVATION_TIMEOUT", 0), "Maximum time a backend activation may continue after the first request times out")
+	scaleDownEnable := flag.Bool("scale-down", envOrDefaultBool("ACTIVATOR_SCALE_DOWN", true), "Enable integrated scale-down controller")
 	flag.Parse()
 
 	resolvedActivationTTL := *activationTimeout
@@ -450,17 +459,18 @@ func loadConfig() (Config, error) {
 	}
 
 	cfg = Config{
-		ListenAddr:     strings.TrimSpace(*listenAddr),
-		RedisAddr:      strings.TrimSpace(*redisAddr),
-		RedisPassword:  *redisPassword,
-		RedisDB:        *redisDB,
-		NomadAddr:      strings.TrimSpace(*nomadAddr),
-		ConsulAddr:     strings.TrimSpace(*consulAddr),
-		NomadToken:     strings.TrimSpace(*nomadToken),
-		ConsulToken:    strings.TrimSpace(*consulToken),
-		RequestTimeout: *requestTimeout,
-		ActivationTTL:  resolvedActivationTTL,
-		ProbePath:      normalizeProbePath(*probePath),
+		ListenAddr:      strings.TrimSpace(*listenAddr),
+		RedisAddr:       strings.TrimSpace(*redisAddr),
+		RedisPassword:   *redisPassword,
+		RedisDB:         *redisDB,
+		NomadAddr:       strings.TrimSpace(*nomadAddr),
+		ConsulAddr:      strings.TrimSpace(*consulAddr),
+		NomadToken:      strings.TrimSpace(*nomadToken),
+		ConsulToken:     strings.TrimSpace(*consulToken),
+		RequestTimeout:  *requestTimeout,
+		ActivationTTL:   resolvedActivationTTL,
+		ProbePath:       normalizeProbePath(*probePath),
+		ScaleDownEnable: *scaleDownEnable,
 	}
 
 	if cfg.ListenAddr == "" {
@@ -562,6 +572,15 @@ func envOrDefaultDuration(key string, defaultVal time.Duration) time.Duration {
 func envOrDefaultInt(key string, defaultVal int) int {
 	if v := os.Getenv(key); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil {
+			return parsed
+		}
+	}
+	return defaultVal
+}
+
+func envOrDefaultBool(key string, defaultVal bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
 			return parsed
 		}
 	}
