@@ -130,6 +130,59 @@ func TestScaleDownControllerSkipsRecentActivity(t *testing.T) {
 	}
 }
 
+func TestScaleDownControllerSkipsYoungWorkload(t *testing.T) {
+	t.Parallel()
+
+	scaledDown := false
+	nomad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/job/echo-s2z-test":
+			_, _ = io.WriteString(w, `{"Status":"running","TaskGroups":[{"Name":"main","Count":1}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/job/echo-s2z-test/scale":
+			scaledDown = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		}
+	}))
+	defer nomad.Close()
+
+	// Activity set 30s ago — past idleTimeout (10s) but within minScaleDownAge (5min).
+	store := &fakeStateStore{
+		workloads: map[string]WorkloadRegistration{
+			"echo.test.local": {
+				HostName:    "echo.test.local",
+				ServiceName: "echo-svc",
+				JobName:     "echo-s2z-test",
+				GroupName:   "main",
+			},
+		},
+		activityTimes: map[string]time.Time{
+			"echo-svc": time.Now().UTC().Add(-30 * time.Second),
+		},
+	}
+
+	controller := &ScaleDownController{
+		logger:          testLogger(),
+		store:           store,
+		nomadAddr:       nomad.URL,
+		client:          nomad.Client(),
+		idleTimeout:     10 * time.Second,
+		scanInterval:    1 * time.Second,
+		minScaleDownAge: 5 * time.Minute,
+		ownerID:         "test-owner",
+	}
+
+	ctx := context.Background()
+	controller.scanAndScaleDown(ctx)
+
+	if scaledDown {
+		t.Fatal("expected job NOT to be scaled down (within minScaleDownAge)")
+	}
+}
+
 func TestScaleDownControllerSkipsPendingActivation(t *testing.T) {
 	t.Parallel()
 

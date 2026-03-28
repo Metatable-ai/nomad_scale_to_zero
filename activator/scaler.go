@@ -205,12 +205,18 @@ func (c *ScaleDownController) shouldScaleDown(ctx context.Context, workload Work
 		return false, ""
 	}
 
-	idleFor := now.Sub(lastActivity)
-	if idleFor < c.idleTimeout {
+	// Enforce minimum age before first scale-down to avoid scaling down
+	// jobs that were just registered and haven't received traffic yet.
+	age := now.Sub(lastActivity)
+	if age < c.minScaleDownAge {
 		return false, ""
 	}
 
-	return true, fmt.Sprintf("idle for %s (threshold %s)", idleFor.Round(time.Second), c.idleTimeout)
+	if age < c.idleTimeout {
+		return false, ""
+	}
+
+	return true, fmt.Sprintf("idle for %s (threshold %s)", age.Round(time.Second), c.idleTimeout)
 }
 
 func (c *ScaleDownController) getJobGroupCount(ctx context.Context, jobID, groupName string) (int, error) {
