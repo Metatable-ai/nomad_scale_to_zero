@@ -120,6 +120,23 @@ When Traefik's Prometheus endpoint is enabled, ScaleWaker also emits bounded wak
 
 These metrics intentionally avoid per-service labels; use the structured plugin logs for service/job detail.
 
+### Experimental activator path
+
+The `activator/` service is the in-progress 1000+ job redesign. On this branch, E2E cold-miss traffic now goes through the activator fallback route instead of the old dummy fallback service:
+
+- Traefik sends unmatched `*.localhost` requests to `activator`
+- the activator looks up the dormant host in Redis
+- it acquires a distributed wake lock, scales the Nomad job up, waits for a healthy allocation, records activity, and proxies the held request directly to the backend
+- once Consul catches up, the normal per-service Traefik router and middleware can take over the warm path again
+
+The activator also exposes:
+
+- `POST /admin/registry/sync` to load the rendered workload manifest into Redis
+- `GET /registry/lookup?host=...` for dormant host resolution
+- `POST /activate` for the explicit hold-and-proxy activation contract
+
+The E2E harness now validates activator mode with request success and metadata checks, rather than requiring every cold wake to first converge through Consul registration.
+
 ### Background path (scale-down)
 
 1. The **idle-scaler** periodically scans for scale-to-zero-enabled jobs.
@@ -323,6 +340,7 @@ The policies used by the local ACL script live in `local-test/nomad/`:
 ## 📦 Repository Layout
 
 - **`traefik-plugin/`** — ScaleWaker Traefik middleware plugin (Go)
+- **`activator/`** — Experimental dedicated activator service for the 1000+ job redesign (Go)
 - **`idle-scaler/`** — Idle scaler agent (Go)
 - **`activity-store/`** — Shared store abstraction (Consul KV / Redis)
 - **`e2e/`** — Docker end-to-end harness, reusable topology/workload profiles, and Nomad job templates

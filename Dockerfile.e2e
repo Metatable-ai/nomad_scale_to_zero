@@ -16,11 +16,13 @@ RUN apt-get update \
 WORKDIR /app
 
 # Copy go.mod/go.sum first for layer caching
+COPY activator/go.mod activator/go.sum* activator/
 COPY activity-store/go.mod activity-store/go.sum* activity-store/
 COPY idle-scaler/go.mod idle-scaler/go.sum* idle-scaler/
 COPY traefik-plugin/go.mod traefik-plugin/
 
 # Download deps for binaries used by the e2e runner image
+RUN cd activator && go mod download
 RUN cd activity-store && go mod download
 RUN cd idle-scaler && go mod download
 
@@ -28,6 +30,7 @@ RUN cd idle-scaler && go mod download
 COPY . .
 
 # Build idle-scaler binary for the Nomad docker job
+RUN cd activator && go build -o /app/bin/activator .
 RUN cd idle-scaler && go build -o /app/bin/idle-scaler .
 RUN cd idle-scaler && go build -o /app/bin/e2e-echo ./cmd/e2e-echo
 

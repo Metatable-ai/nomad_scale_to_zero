@@ -31,6 +31,7 @@ run_suite() {
   fi
 }
 
+run_suite "activator (unit)"              /app/activator
 run_suite "traefik-plugin (unit)"         /app/traefik-plugin
 run_suite "traefik-plugin (integration)"  /app/traefik-plugin -tags=integration -run '^TestIntegration_'
 run_suite "activity-store (unit)"         /app/activity-store

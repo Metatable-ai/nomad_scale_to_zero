@@ -28,6 +28,8 @@ K6_TARGET_MODE="${E2E_K6_TARGET_MODE:-random}"
 TARGET_NOMAD_CLIENTS="${E2E_TARGET_NOMAD_CLIENTS:-${E2E_NOMAD_CLIENTS:-1}}"
 IDLE_SCALER_PLACEMENT="${E2E_TARGET_IDLE_SCALER_PLACEMENT:-docker-compose-service}"
 IDLE_SCALER_ISOLATION_MODE="${E2E_TARGET_IDLE_SCALER_ISOLATION_MODE:-disabled}"
+ACTIVATOR_ENABLED="${E2E_ENABLE_ACTIVATOR_SERVICE:-true}"
+ACTIVATOR_URL="${E2E_ACTIVATOR_BASE_URL:-http://activator:8090}"
 IDLE_SCALER_EXPECTED_RUNNING=1
 REQUEST_TIMEOUT="${E2E_REQUEST_TIMEOUT:-45s}"
 REQUESTED_SCENARIO_SET="${E2E_SCENARIO_SET:-mixed-traffic}"
@@ -326,6 +328,8 @@ write_run_metadata() {
 		--arg target_redis_nodes "${E2E_TARGET_REDIS_NODES:-0}" \
 		--arg idle_scaler_placement "$IDLE_SCALER_PLACEMENT" \
 		--arg idle_scaler_isolation_mode "$IDLE_SCALER_ISOLATION_MODE" \
+		--arg activator_enabled "$ACTIVATOR_ENABLED" \
+		--arg activator_url "$ACTIVATOR_URL" \
 		--arg workload_mix "${E2E_WORKLOAD_MIX_LABELS:-}" \
 		--arg workload_fast_api_count "${E2E_WORKLOAD_FAST_API_COUNT:-0}" \
 		--arg workload_slow_start_count "${E2E_WORKLOAD_SLOW_START_COUNT:-0}" \
@@ -399,6 +403,10 @@ write_run_metadata() {
 				isolation_active: $idle_scaler_isolation_active,
 				isolation_activation_phase: (if $idle_scaler_isolation_mode == "disabled" then null else "after-initial-scale-to-zero" end),
 				post_initial_scale_to_zero_expected: $post_initial_scale_to_zero_expected
+			},
+			activator: {
+				enabled: ($activator_enabled == "true"),
+				base_url: $activator_url
 			},
 			workload: {
 				mix_labels: ($workload_mix | csv),
@@ -528,6 +536,15 @@ resolve_idle_scaler_observability_url() {
 	[ -n "$address" ] && [ -n "$port" ] || return 1
 
 	printf 'http://%s:%s' "$address" "$port"
+}
+
+sync_activator_registry_if_enabled() {
+	if [ "$ACTIVATOR_ENABLED" != "true" ]; then
+		return 0
+	fi
+
+	printf "${CYAN}=== Sync activator registry ===${NC}\n"
+	"$ROOT_DIR"/e2e/scripts/sync-activator-registry.sh "$WORKLOAD_MANIFEST_FILE" "$ACTIVATOR_URL"
 }
 
 capture_state_snapshot() {
@@ -1166,6 +1183,17 @@ request_workload_metadata() {
 	echo "Validated metadata for $service_name ($expected_class)"
 }
 
+wait_for_service_ready() {
+	service_name="$1"
+	workload_class="$2"
+
+	if [ "$ACTIVATOR_ENABLED" = "true" ]; then
+		request_workload_metadata "$service_name" "$workload_class"
+	else
+		"$ROOT_DIR"/e2e/scripts/wait-for-consul-checks.sh "_nomad-check-" 1 "$startup_ready_timeout" "$service_name"
+	fi
+}
+
 wake_workload_job() {
 	job_name="$1"
 	service_name="$2"
@@ -1177,7 +1205,7 @@ wake_workload_job() {
 	request_pid=$!
 
 	"$ROOT_DIR"/e2e/scripts/wait-for-nomad-job.sh "$job_name" 1 "$nomad_wake_timeout"
-	"$ROOT_DIR"/e2e/scripts/wait-for-consul-checks.sh "_nomad-check-" 1 "$startup_ready_timeout" "$service_name"
+	wait_for_service_ready "$service_name" "$workload_class"
 	wait "$request_pid"
 
 	wake_finished_at="$(timestamp_utc)"
@@ -1247,6 +1275,14 @@ wait_for_all_workload_checks_healthy_concurrently() {
 			exit 1
 		fi
 	done
+}
+
+wait_for_all_workloads_ready_concurrently() {
+	if [ "$ACTIVATOR_ENABLED" = "true" ]; then
+		validate_all_workloads_metadata_concurrently
+	else
+		wait_for_all_workload_checks_healthy_concurrently
+	fi
 }
 
 validate_all_workloads_metadata_concurrently() {
@@ -1344,10 +1380,11 @@ run_k6_cycle() {
 
 	if [ "$target_mode" = "fixed" ]; then
 		"$ROOT_DIR"/e2e/scripts/wait-for-nomad-job.sh "$service_name" 1 "$nomad_wake_timeout"
-		"$ROOT_DIR"/e2e/scripts/wait-for-consul-checks.sh "_nomad-check-" 1 "$startup_ready_timeout" "$service_name"
+		workload_class="$(manifest_class_for_job "$service_name")"
+		wait_for_service_ready "$service_name" "$workload_class"
 	elif [ "$scenario_name" = "coldstart" ] || [ "$target_mode" = "round-robin" ]; then
 		"$ROOT_DIR"/e2e/scripts/wait-for-nomad-running-count.sh "$WORKLOAD_PREFIX" "$JOB_COUNT" exact "$startup_ready_timeout" "$JOB_COUNT"
-		wait_for_all_workload_checks_healthy_concurrently
+		wait_for_all_workloads_ready_concurrently
 	else
 		"$ROOT_DIR"/e2e/scripts/wait-for-nomad-running-count.sh "$WORKLOAD_PREFIX" 1 at-least "$nomad_wake_timeout" "$JOB_COUNT"
 	fi
@@ -1788,6 +1825,8 @@ record_event "run-start" "running" "$(jq -nc \
 	--arg profile "${E2E_PROFILE:-}" \
 	--arg idle_scaler_placement "$IDLE_SCALER_PLACEMENT" \
 	--arg idle_scaler_isolation_mode "$IDLE_SCALER_ISOLATION_MODE" \
+	--argjson activator_enabled "$( [ "$ACTIVATOR_ENABLED" = "true" ] && printf 'true' || printf 'false' )" \
+	--arg activator_url "$ACTIVATOR_URL" \
 	--arg requested_scenario_set "$REQUESTED_SCENARIO_SET" \
 	--arg effective_scenario_set "$SCENARIO_SET" \
 	--arg excluded_scenario_set "$EXCLUDED_SCENARIO_SET" \
@@ -1797,6 +1836,8 @@ record_event "run-start" "running" "$(jq -nc \
 		profile: $profile,
 		idle_scaler_placement: $idle_scaler_placement,
 		idle_scaler_isolation_mode: $idle_scaler_isolation_mode,
+		activator_enabled: $activator_enabled,
+		activator_url: $activator_url,
 		requested_scenario_set: $requested_scenario_set,
 		effective_scenario_set: $effective_scenario_set,
 		excluded_scenario_set: (if $excluded_scenario_set == "" then null else $excluded_scenario_set end),
@@ -1806,6 +1847,9 @@ record_event "run-start" "running" "$(jq -nc \
 "$ROOT_DIR"/e2e/scripts/wait-for-http.sh "$CONSUL_ADDR/v1/status/leader" consul
 "$ROOT_DIR"/e2e/scripts/wait-for-http.sh "$NOMAD_ADDR/v1/status/leader" nomad
 "$ROOT_DIR"/e2e/scripts/wait-for-http.sh "$TRAEFIK_URL/ping" traefik
+if [ "$ACTIVATOR_ENABLED" = "true" ]; then
+	"$ROOT_DIR"/e2e/scripts/wait-for-http.sh "$ACTIVATOR_URL/readyz" activator
+fi
 "$ROOT_DIR"/e2e/scripts/wait-for-nomad-ready-nodes.sh "$TARGET_NOMAD_CLIENTS" "$startup_ready_timeout"
 "$ROOT_DIR"/e2e/scripts/wait-for-consul-checks.sh "_nomad-check-" 1 "$consul_checks_timeout"
 prepare_idle_scaler
@@ -1815,6 +1859,7 @@ capture_state_snapshot "control-plane-ready"
 printf "${CYAN}=== Generate Nomad jobs ===${NC}\n"
 "$ROOT_DIR"/e2e/scripts/render-workload-jobs.sh
 require_workload_manifest
+sync_activator_registry_if_enabled
 persist_generated_artifacts
 
 printf "${CYAN}=== Submit workload jobs ===${NC}\n"

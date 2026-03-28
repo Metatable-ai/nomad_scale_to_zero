@@ -8,18 +8,11 @@ http:
       priority: 1
       entryPoints:
         - http
-      service: s2z-fallback
-      middlewares:
-        - scalewaker-fallback
+      service: s2z-activator
 
   services:
-    s2z-fallback:
+    s2z-activator:
       loadBalancer:
+        passHostHeader: true
         servers:
-          - url: "http://127.0.0.1:1"
-
-  middlewares:
-    scalewaker-fallback:
-      plugin:
-        scalewaker:
-          timeout: "45s"
+          - url: "http://activator:8090"
