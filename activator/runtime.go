@@ -245,7 +245,10 @@ func (r *nomadRuntime) runActivation(ctx context.Context, workload WorkloadRegis
 	activationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.activationTTL)
 	defer cancel()
 
+	activationStart := time.Now()
 	endpoint, err := r.performWake(activationCtx, workload, logger)
+	activationMs := time.Since(activationStart).Milliseconds()
+
 	state := ActivationState{
 		Status: activationStatusFailed,
 		Owner:  owner,
@@ -253,12 +256,12 @@ func (r *nomadRuntime) runActivation(ctx context.Context, workload WorkloadRegis
 	stateTTL := activationFailureTTL
 	if err != nil {
 		state.Error = err.Error()
-		logger.WarnContext(activationCtx, "backend activation failed", "error", err)
+		logger.WarnContext(activationCtx, "backend activation failed", "error", err, "activation_ms", activationMs)
 	} else if endpoint != nil {
 		state.Status = activationStatusReady
 		state.Endpoint = endpoint.String()
 		stateTTL = readyEndpointTTL
-		logger.InfoContext(activationCtx, "backend activation ready", "target", endpoint.String())
+		logger.InfoContext(activationCtx, "backend activation ready", "target", endpoint.String(), "activation_ms", activationMs)
 	}
 
 	stateCtx, stateCancel := context.WithTimeout(context.Background(), activationStateOpTimeout)
@@ -384,22 +387,32 @@ func (r *nomadRuntime) lookupActivationReadyEndpoint(ctx context.Context, worklo
 
 func (r *nomadRuntime) performWake(ctx context.Context, workload WorkloadRegistration, logger *slog.Logger) (*url.URL, error) {
 	// Acquire a Nomad API slot to bound concurrent Nomad calls.
+	semStart := time.Now()
 	if err := r.acquireNomadSlot(ctx); err != nil {
 		return nil, fmt.Errorf("acquire nomad slot: %w", err)
 	}
 	defer r.releaseNomadSlot()
+	semWait := time.Since(semStart)
 
+	resolveStart := time.Now()
 	if endpoint, healthy, err := r.resolveHealthyEndpoint(ctx, workload); err != nil {
 		logger.WarnContext(ctx, "consul health check failed under activator wake lock", "error", err)
 	} else if healthy {
 		r.cacheReadyEndpoint(ctx, workload, endpoint, logger)
+		logger.InfoContext(ctx, "activation trace: already healthy",
+			"sem_wait_ms", semWait.Milliseconds(),
+			"resolve_ms", time.Since(resolveStart).Milliseconds(),
+		)
 		return endpoint, nil
 	}
 
+	ensureStart := time.Now()
 	if err := r.ensureJob(ctx, workload); err != nil {
 		return nil, fmt.Errorf("ensure job: %w", err)
 	}
+	ensureMs := time.Since(ensureStart).Milliseconds()
 
+	scaleStart := time.Now()
 	if err := r.scaleUp(ctx, workload.JobName, workload.GroupName); err != nil {
 		endpoint, waitErr := r.waitForNomadAllocation(ctx, workload.JobName, workload.GroupName)
 		if waitErr == nil {
@@ -408,13 +421,25 @@ func (r *nomadRuntime) performWake(ctx context.Context, workload WorkloadRegistr
 		}
 		return nil, fmt.Errorf("scale up: %w", err)
 	}
+	scaleMs := time.Since(scaleStart).Milliseconds()
 
+	allocStart := time.Now()
 	endpoint, err := r.waitForNomadAllocation(ctx, workload.JobName, workload.GroupName)
 	if err != nil {
 		return nil, fmt.Errorf("wait allocation: %w", err)
 	}
+	allocMs := time.Since(allocStart).Milliseconds()
 
 	r.cacheReadyEndpoint(ctx, workload, endpoint, logger)
+
+	logger.InfoContext(ctx, "activation trace",
+		"sem_wait_ms", semWait.Milliseconds(),
+		"ensure_ms", ensureMs,
+		"scale_ms", scaleMs,
+		"alloc_wait_ms", allocMs,
+		"total_ms", time.Since(semStart).Milliseconds(),
+	)
+
 	return endpoint, nil
 }
 

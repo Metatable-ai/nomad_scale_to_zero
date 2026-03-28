@@ -315,13 +315,16 @@ func (a *Activator) handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
+	activateStart := time.Now()
 	target, err := a.runtime.Activate(ctx, workload)
+	activateMs := time.Since(activateStart).Milliseconds()
 	if err != nil {
 		a.logger.Error("activator request failed to wake backend",
 			"host", host,
 			"service_name", workload.ServiceName,
 			"job_name", workload.JobName,
 			"path", r.URL.Path,
+			"activate_ms", activateMs,
 			"error", err,
 		)
 		w.Header().Set("Retry-After", "1")
@@ -351,6 +354,7 @@ func (a *Activator) handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		"job_name", workload.JobName,
 		"target", target.String(),
 		"path", r.URL.Path,
+		"activate_ms", activateMs,
 	)
 	proxyTo(w, r, target, a.logger.With("host", host, "target", target.String()))
 }
