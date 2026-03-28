@@ -658,9 +658,16 @@ func (r *nomadRuntime) getNomadAllocation(ctx context.Context, allocID string) (
 func (r *nomadRuntime) waitForNomadAllocation(ctx context.Context, job, group string) (*url.URL, error) {
 	startedAt := time.Now()
 	logger := r.logger.With("job", job, "group", group)
+	lastScaleUpAt := startedAt
+
+	// Start event stream watcher for instant allocation notifications.
+	// If the stream fails to connect, eventCh closes immediately and we fall back to polling.
+	eventCtx, eventCancel := context.WithCancel(ctx)
+	defer eventCancel()
+	eventCh := r.watchAllocEvents(eventCtx, job, group)
+
 	timer := time.NewTimer(0)
 	defer timer.Stop()
-	lastScaleUpAt := startedAt
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -670,53 +677,14 @@ func (r *nomadRuntime) waitForNomadAllocation(ctx context.Context, job, group st
 			return nil, err
 		}
 
-		allocs, err := r.getNomadAllocations(ctx, job)
+		endpoint, sawActive, err := r.checkAllocations(ctx, job, group, logger)
 		if err != nil {
 			return nil, err
 		}
-
-		sawActiveAllocation := false
-		for _, alloc := range allocs {
-			if alloc.TaskGroup != group {
-				continue
-			}
-			if alloc.ClientStatus == "pending" || alloc.ClientStatus == "running" {
-				sawActiveAllocation = true
-			}
-			if alloc.ClientStatus != "running" {
-				continue
-			}
-
-			allTasksRunning := len(alloc.TaskStates) > 0
-			for _, state := range alloc.TaskStates {
-				if state.State != "running" {
-					allTasksRunning = false
-					break
-				}
-			}
-			if !allTasksRunning {
-				continue
-			}
-
-			endpoint := extractAllocEndpoint(alloc)
-			if endpoint == nil {
-				fullAlloc, err := r.getNomadAllocation(ctx, alloc.ID)
-				if err != nil {
-					logger.WarnContext(ctx, "failed to fetch full allocation", "alloc_id", shortAllocID(alloc.ID), "error", err)
-					continue
-				}
-				endpoint = extractAllocEndpoint(*fullAlloc)
-			}
-			if endpoint == nil {
-				logger.WarnContext(ctx, "allocation running but no network endpoint found", "alloc_id", shortAllocID(alloc.ID))
-				continue
-			}
-			if r.probeEndpointHealth(ctx, endpoint) {
-				logger.InfoContext(ctx, "nomad allocation healthy", "alloc_id", shortAllocID(alloc.ID), "target", endpoint.String())
-				return endpoint, nil
-			}
+		if endpoint != nil {
+			return endpoint, nil
 		}
-		if !sawActiveAllocation {
+		if !sawActive {
 			reasserted, err := r.reassertScaleUpIfNeeded(ctx, job, group, logger, lastScaleUpAt)
 			if err != nil {
 				return nil, err
@@ -726,6 +694,7 @@ func (r *nomadRuntime) waitForNomadAllocation(ctx context.Context, job, group st
 			}
 		}
 
+		// Compute fallback poll interval (used only if no event arrives sooner).
 		elapsed := time.Since(startedAt)
 		var pollInterval time.Duration
 		switch {
@@ -745,15 +714,93 @@ func (r *nomadRuntime) waitForNomadAllocation(ctx context.Context, job, group st
 		}
 		timer.Reset(pollInterval)
 
+		// Wait for either an event stream notification, poll timer, or context cancellation.
 		select {
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				return nil, waitForActivationTimeoutError{service: job + "/" + group}
 			}
 			return nil, ctx.Err()
+
+		case evt, ok := <-eventCh:
+			if !ok {
+				// Event stream closed (disconnected or failed to connect).
+				// Nil the channel so we only use polling from here.
+				eventCh = nil
+				continue
+			}
+			if evt.AllRunning {
+				logger.InfoContext(ctx, "event stream: allocation running",
+					"alloc_id", shortAllocID(evt.AllocID),
+					"elapsed", time.Since(startedAt).Round(time.Millisecond).String(),
+				)
+				// Fetch full allocation for endpoint info + health probe.
+				endpoint, _, err := r.checkAllocations(ctx, job, group, logger)
+				if err != nil {
+					return nil, err
+				}
+				if endpoint != nil {
+					return endpoint, nil
+				}
+				// Event said running but probe failed — continue loop.
+			}
+
 		case <-timer.C:
+			// Fallback poll cycle.
 		}
 	}
+}
+
+// checkAllocations fetches current allocations and returns the first healthy endpoint.
+// Returns (endpoint, sawActiveAllocation, error).
+func (r *nomadRuntime) checkAllocations(ctx context.Context, job, group string, logger *slog.Logger) (*url.URL, bool, error) {
+	allocs, err := r.getNomadAllocations(ctx, job)
+	if err != nil {
+		return nil, false, err
+	}
+
+	sawActive := false
+	for _, alloc := range allocs {
+		if alloc.TaskGroup != group {
+			continue
+		}
+		if alloc.ClientStatus == "pending" || alloc.ClientStatus == "running" {
+			sawActive = true
+		}
+		if alloc.ClientStatus != "running" {
+			continue
+		}
+
+		allTasksRunning := len(alloc.TaskStates) > 0
+		for _, state := range alloc.TaskStates {
+			if state.State != "running" {
+				allTasksRunning = false
+				break
+			}
+		}
+		if !allTasksRunning {
+			continue
+		}
+
+		endpoint := extractAllocEndpoint(alloc)
+		if endpoint == nil {
+			fullAlloc, err := r.getNomadAllocation(ctx, alloc.ID)
+			if err != nil {
+				logger.WarnContext(ctx, "failed to fetch full allocation", "alloc_id", shortAllocID(alloc.ID), "error", err)
+				continue
+			}
+			endpoint = extractAllocEndpoint(*fullAlloc)
+		}
+		if endpoint == nil {
+			logger.WarnContext(ctx, "allocation running but no network endpoint found", "alloc_id", shortAllocID(alloc.ID))
+			continue
+		}
+		if r.probeEndpointHealth(ctx, endpoint) {
+			logger.InfoContext(ctx, "nomad allocation healthy", "alloc_id", shortAllocID(alloc.ID), "target", endpoint.String())
+			return endpoint, sawActive, nil
+		}
+	}
+	return nil, sawActive, nil
 }
 
 func (r *nomadRuntime) reassertScaleUpIfNeeded(ctx context.Context, job, group string, logger *slog.Logger, lastScaleUpAt time.Time) (bool, error) {

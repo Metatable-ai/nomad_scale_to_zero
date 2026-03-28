@@ -9,10 +9,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func hasPrefix(s, prefix string) bool { return strings.HasPrefix(s, prefix) }
 
 func TestNomadRuntimeActivateUsesSharedReadyState(t *testing.T) {
 	t.Parallel()
@@ -135,6 +138,15 @@ func TestNomadRuntimePerformWakeSkipsRegisterForDeadJob(t *testing.T) {
 	scaleCalls := 0
 
 	nomad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && hasPrefix(r.URL.Path, "/v1/event/stream") {
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+			return
+		}
+
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -215,6 +227,16 @@ func TestNomadRuntimeWaitForNomadAllocationReassertsScaleUp(t *testing.T) {
 	scaleCalls := 0
 
 	nomad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Event stream must not hold the mutex — it blocks until context cancels.
+		if r.Method == http.MethodGet && hasPrefix(r.URL.Path, "/v1/event/stream") {
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+			return
+		}
+
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -271,4 +293,112 @@ func TestNomadRuntimeWaitForNomadAllocationReassertsScaleUp(t *testing.T) {
 	if scaleCalls == 0 {
 		t.Fatalf("scaleCalls = %d, want at least 1 reasserted scale-up", scaleCalls)
 	}
+}
+
+func TestNomadRuntimeWaitForAllocationUsesEventStream(t *testing.T) {
+	t.Parallel()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer backend.Close()
+
+	backendURL := mustURL(t, backend.URL)
+	backendPort, err := strconv.Atoi(backendURL.Port())
+	if err != nil {
+		t.Fatalf("parse backend port: %v", err)
+	}
+
+	var mu sync.Mutex
+	allocReady := false
+	allocPollCount := 0
+
+	nomad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && hasPrefix(r.URL.Path, "/v1/event/stream") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			// Wait a bit then send an AllocationUpdated event with running status.
+			time.Sleep(100 * time.Millisecond)
+
+			mu.Lock()
+			allocReady = true
+			mu.Unlock()
+
+			event := `{"Index":1,"Events":[{"Topic":"Allocation","Type":"AllocationUpdated","Key":"alloc-evt-1","Payload":{"Allocation":{"ID":"alloc-evt-1","JobID":"echo-s2z-0001","TaskGroup":"main","ClientStatus":"running","TaskStates":{"echo":{"State":"running"}}}}}]}` + "\n"
+			_, _ = io.WriteString(w, event)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+			return
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/job/echo-s2z-0001/allocations":
+			allocPollCount++
+			if !allocReady {
+				_, _ = io.WriteString(w, `[]`)
+				return
+			}
+			payload := `[{
+				"ID":"alloc-evt-1",
+				"TaskGroup":"main",
+				"ClientStatus":"running",
+				"TaskStates":{"echo":{"State":"running"}},
+				"Resources":{"Networks":[{"IP":"` + backendURL.Hostname() + `","DynamicPorts":[{"Label":"http","Value":` + strconv.Itoa(backendPort) + `}]}]}
+			}]`
+			_, _ = io.WriteString(w, payload)
+		default:
+			t.Logf("nomad request %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		}
+	}))
+	defer nomad.Close()
+
+	runtime := &nomadRuntime{
+		logger:         testLogger(),
+		store:          &fakeStateStore{},
+		client:         nomad.Client(),
+		nomadAddr:      nomad.URL,
+		requestTimeout: 45 * time.Second,
+		activationTTL:  90 * time.Second,
+		probePath:      "/healthz",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	endpoint, err := runtime.waitForNomadAllocation(ctx, "echo-s2z-0001", "main")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("waitForNomadAllocation() error = %v", err)
+	}
+	if endpoint == nil || endpoint.String() != backend.URL {
+		t.Fatalf("waitForNomadAllocation() endpoint = %v, want %s", endpoint, backend.URL)
+	}
+
+	// The event stream sends the event after 100ms, so we should complete
+	// reasonably quickly via the event-driven path.
+	if elapsed > 2*time.Second {
+		t.Fatalf("waitForNomadAllocation() took %s, want < 2s (event-driven)", elapsed)
+	}
+
+	mu.Lock()
+	polls := allocPollCount
+	mu.Unlock()
+
+	t.Logf("completed in %s with %d alloc polls (event-driven)", elapsed.Round(time.Millisecond), polls)
 }
