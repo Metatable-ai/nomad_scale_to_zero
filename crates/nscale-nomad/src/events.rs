@@ -125,6 +125,10 @@ async fn connect_and_consume(
                             }
                             match serde_json::from_str::<EventStreamFrame>(line) {
                                 Ok(frame) => {
+                                    // Skip heartbeat frames (empty events, index 0)
+                                    if frame.events.is_empty() {
+                                        continue;
+                                    }
                                     *last_index = frame.index;
                                     for envelope in frame.events {
                                         let event = NomadEvent {

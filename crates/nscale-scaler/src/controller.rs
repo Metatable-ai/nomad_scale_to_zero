@@ -5,6 +5,7 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::JobId;
 use nscale_core::traits::{ActivityStore, Orchestrator};
 use nscale_store::registry::JobRegistry;
@@ -24,6 +25,7 @@ pub struct ScaleDownController {
     registry: Arc<JobRegistry>,
     coordinator: Arc<WakeCoordinator>,
     traffic_probe: Option<Arc<TrafficProbe>>,
+    in_flight: InFlightTracker,
     idle_threshold: Duration,
     interval: Duration,
     lock_ttl: Duration,
@@ -31,12 +33,14 @@ pub struct ScaleDownController {
 }
 
 impl ScaleDownController {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         orchestrator: Arc<dyn Orchestrator>,
         store: Arc<dyn ActivityStore>,
         registry: Arc<JobRegistry>,
         coordinator: Arc<WakeCoordinator>,
         traffic_probe: Option<Arc<TrafficProbe>>,
+        in_flight: InFlightTracker,
         idle_threshold: Duration,
         interval: Duration,
         cancel: CancellationToken,
@@ -49,6 +53,7 @@ impl ScaleDownController {
             registry,
             coordinator,
             traffic_probe,
+            in_flight,
             idle_threshold,
             interval,
             lock_ttl,
@@ -85,7 +90,11 @@ impl ScaleDownController {
     #[instrument(skip(self))]
     async fn tick(&self) -> nscale_core::error::Result<()> {
         // Try to acquire distributed lock
-        if !self.store.try_acquire_lock(SCALE_DOWN_LOCK_KEY, self.lock_ttl).await? {
+        if !self
+            .store
+            .try_acquire_lock(SCALE_DOWN_LOCK_KEY, self.lock_ttl)
+            .await?
+        {
             debug!("another instance holds the scale-down lock, skipping");
             return Ok(());
         }
@@ -95,29 +104,11 @@ impl ScaleDownController {
             key: SCALE_DOWN_LOCK_KEY,
         };
 
-        // ── Phase 1: ensure every running registered job has an activity record ──
-        // When Traefik routes directly via ConsulCatalog, nscale's proxy never
-        // sees those requests, so the activity sorted set may be empty even for
-        // running services.  We seed activity for any registered job that is
-        // currently running but has no activity entry.
-        if let Ok(all_regs) = self.registry.list_all().await {
-            for reg in &all_regs {
-                // Skip if already tracked in the activity set
-                let tracked = self.store.has_activity(&reg.job_id).await.unwrap_or(false);
-                if tracked {
-                    continue;
-                }
-                // Check if the job is actually running in Nomad
-                if let Ok(count) = self.orchestrator.get_job_count(&reg.job_id, &reg.nomad_group).await {
-                    if count > 0 {
-                        debug!(job_id = %reg.job_id, "running job has no activity record, seeding");
-                        let _ = self.store.record_activity(&reg.job_id).await;
-                    }
-                }
-            }
-        }
+        // Activity seeding is handled reactively by the Nomad event stream
+        // processor (EventProcessor). The stream subscribes to Allocation
+        // events and records activity when allocations reach "running".
 
-        // ── Phase 2: find and scale down truly idle jobs ──
+        // Find and scale down truly idle jobs
         let idle_jobs = self.store.get_idle_jobs(self.idle_threshold).await?;
         if idle_jobs.is_empty() {
             debug!("no idle jobs found");
@@ -138,6 +129,19 @@ impl ScaleDownController {
 
     #[instrument(skip(self), fields(job_id = %job_id))]
     async fn scale_down_job(&self, job_id: &JobId) {
+        // --- In-flight guard: skip if nscale is actively proxying requests for this job ---
+        if self.in_flight.has_in_flight(&job_id.0) {
+            let count = self.in_flight.count(&job_id.0);
+            info!(
+                in_flight = count,
+                "job has in-flight proxy requests, refreshing activity"
+            );
+            if let Err(e) = self.store.record_activity(job_id).await {
+                warn!(error = %e, "failed to refresh activity for in-flight job");
+            }
+            return;
+        }
+
         // --- Traffic guard: skip if Traefik is actively routing to this service ---
         if let Some(probe) = &self.traffic_probe {
             match probe.has_active_traffic(job_id).await {
@@ -290,6 +294,7 @@ mod tests {
         }
     }
 
+    #[expect(dead_code)]
     struct MockDiscovery;
 
     #[async_trait::async_trait]
@@ -318,12 +323,27 @@ mod tests {
         let _store_ref = store.clone();
 
         // The lock is acquirable
-        assert!(store.try_acquire_lock("test", Duration::from_secs(5)).await.unwrap());
+        assert!(
+            store
+                .try_acquire_lock("test", Duration::from_secs(5))
+                .await
+                .unwrap()
+        );
         // Second attempt fails
-        assert!(!store.try_acquire_lock("test", Duration::from_secs(5)).await.unwrap());
+        assert!(
+            !store
+                .try_acquire_lock("test", Duration::from_secs(5))
+                .await
+                .unwrap()
+        );
         // Release
         store.release_lock("test").await.unwrap();
         // Now acquirable again
-        assert!(store.try_acquire_lock("test", Duration::from_secs(5)).await.unwrap());
+        assert!(
+            store
+                .try_acquire_lock("test", Duration::from_secs(5))
+                .await
+                .unwrap()
+        );
     }
 }

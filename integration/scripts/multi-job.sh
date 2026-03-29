@@ -71,7 +71,7 @@ job "${name}" {
           "traefik.enable=true",
           "traefik.http.routers.${name}.rule=Host(\`${name}.localhost\`)",
           "traefik.http.routers.${name}.entryPoints=http",
-          "traefik.http.routers.${name}.middlewares=s2z-error-fallback@file",
+          "traefik.http.routers.${name}.service=s2z-nscale@file",
         ]
 
         check {
@@ -125,7 +125,7 @@ do_submit() {
     local resp
     resp=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${NSCALE_ADDR}/admin/registry" \
       -H 'Content-Type: application/json' \
-      -d "{\"job_id\":\"${name}\",\"service_name\":\"${name}\",\"host\":\"${name}.localhost\",\"nomad_group\":\"main\"}")
+      -d "{\"job_id\":\"${name}\",\"service_name\":\"${name}\",\"endpoint\":\"http://${name}.localhost\",\"nomad_group\":\"main\"}")
     if [[ "$resp" == "201" || "$resp" == "200" ]]; then
       ((ok++))
     else

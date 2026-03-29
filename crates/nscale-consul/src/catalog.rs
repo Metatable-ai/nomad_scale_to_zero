@@ -73,10 +73,7 @@ impl ConsulClient {
 
     /// Deregister the fallback service for a given service name.
     #[instrument(skip(self), fields(service = %service_name))]
-    pub async fn deregister_fallback_service(
-        &self,
-        service_name: &ServiceName,
-    ) -> Result<()> {
+    pub async fn deregister_fallback_service(&self, service_name: &ServiceName) -> Result<()> {
         let service_id = format!("nscale-fallback-{}", service_name);
 
         debug!(service_id = %service_id, "deregistering fallback service");

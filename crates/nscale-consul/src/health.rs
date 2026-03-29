@@ -63,12 +63,11 @@ impl ConsulClient {
             let resp = self.client.get(self.url(&url)).send().await?;
 
             // Extract X-Consul-Index for next blocking query
-            if let Some(idx) = resp.headers().get("X-Consul-Index") {
-                if let Ok(s) = idx.to_str() {
-                    if let Ok(i) = s.parse::<u64>() {
-                        consul_index = i;
-                    }
-                }
+            if let Some(idx) = resp.headers().get("X-Consul-Index")
+                && let Ok(s) = idx.to_str()
+                && let Ok(i) = s.parse::<u64>()
+            {
+                consul_index = i;
             }
 
             if !resp.status().is_success() {

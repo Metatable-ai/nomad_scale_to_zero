@@ -8,6 +8,7 @@ nscale-core = { path = "../nscale-core" }
 nscale-waker = { path = "../nscale-waker" }
 nscale-store = { path = "../nscale-store" }
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

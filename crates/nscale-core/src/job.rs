@@ -90,17 +90,11 @@ pub enum JobState {
     /// Job is scaled to zero, no allocations running.
     Dormant,
     /// Scale-up has been requested, waiting for healthy allocation.
-    Waking {
-        since: tokio::time::Instant,
-    },
+    Waking { since: tokio::time::Instant },
     /// Job is running and healthy, endpoint is known.
-    Ready {
-        endpoint: Endpoint,
-    },
+    Ready { endpoint: Endpoint },
     /// Idle timeout reached, scale-down in progress.
-    Draining {
-        since: tokio::time::Instant,
-    },
+    Draining { since: tokio::time::Instant },
 }
 
 impl JobState {

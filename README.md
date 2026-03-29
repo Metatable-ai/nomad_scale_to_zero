@@ -8,47 +8,133 @@ it wakes the job, proxies the request, and scales idle services back to zero whe
 
 ## Architecture
 
+```mermaid
+graph LR
+    Client([Client]) -->|request| Traefik
+
+    subgraph Traefik["Traefik (reverse proxy)"]
+        CC["ConsulCatalog route<br/>priority 30"]
+        Fallback["s2z-fallback route<br/>priority 1"]
+    end
+
+    CC -->|"service=s2z-nscale#64;file"| nscale
+    Fallback -->|"service=s2z-nscale"| nscale
+
+    nscale -->|proxy| Backend["Nomad job<br/>(healthy allocation)"]
+    nscale -->|scale up| Nomad
+    nscale -->|health poll| Consul
+    nscale -->|activity + registry| Redis
+
+    Nomad -->|registers service| Consul
+    Consul -->|service discovery| Traefik
 ```
-                  ┌──────────┐
-  request ──────► │  Traefik │
-                  └────┬─────┘
-                       │
-          ┌────────────┼────────────┐
-          │ healthy    │  dormant   │
-          ▼            ▼            │
-     ┌─────────┐  ┌────────┐       │
-     │ Backend │  │ nscale │       │
-     └─────────┘  └───┬────┘       │
-                      │            │
-           wake ──────┤            │
-           proxy ─────┤            │
-           scale ─────┘            │
-                                   │
-                  once healthy ────┘
-                  Traefik routes
-                  directly
+
+### Routing paths
+
+All traffic for nscale-managed services flows through nscale on **both** the cold and warm paths.
+This ensures nscale has full visibility into in-flight requests and can prevent premature scale-down.
+
+```mermaid
+graph TD
+    Request([Incoming request]) --> Traefik
+
+    Traefik -->|"Service UP<br/>CC route (prio 30)"| nscale
+    Traefik -->|"Service DOWN<br/>Fallback (prio 1)"| nscale
+
+    nscale -->|Service is running| Proxy["Proxy to backend"]
+    nscale -->|Service is dormant| Wake["Wake → poll Consul → proxy"]
+
+    Proxy --> Backend["Nomad allocation"]
+    Wake -->|scale up| Nomad["Nomad API"]
+    Nomad --> Consul["Consul health check"]
+    Consul -->|healthy| Proxy
+```
+
+**Key insight:** ConsulCatalog routes use `traefik.http.routers.<name>.service=s2z-nscale@file`
+to point back to nscale instead of directly to the Nomad allocation. This guarantees nscale
+tracks every request, enabling in-flight protection and heartbeat-based activity recording.
+
+### In-flight request protection
+
+nscale prevents scale-down of services with active long-running requests using an
+`InFlightTracker` with RAII guards and periodic heartbeats:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Traefik
+    participant nscale
+    participant Backend
+    participant Scaler
+
+    Client->>Traefik: GET /slow?delay=60
+    Traefik->>nscale: route via s2z-nscale@file
+    nscale->>nscale: InFlightTracker.track(job_id)
+    nscale->>nscale: record_activity(start)
+    nscale->>Backend: proxy request
+
+    loop Every idle_timeout / 3
+        nscale->>nscale: heartbeat → record_activity
+    end
+
+    Note over Scaler: Scale-down tick
+    Scaler->>nscale: has_in_flight(job_id)?
+    nscale-->>Scaler: true → skip scale-down
+
+    Backend-->>nscale: response (after 60s)
+    nscale->>nscale: InFlightGuard dropped
+    nscale->>nscale: record_activity(end)
+    nscale-->>Client: response
+
+    Note over Scaler: Next tick after idle_timeout
+    Scaler->>nscale: has_in_flight(job_id)?
+    nscale-->>Scaler: false
+    Scaler->>Scaler: check traffic probe
+    Scaler->>nscale: scale to zero
+```
+
+### Scale-down decision flow
+
+```mermaid
+flowchart TD
+    Tick["Scale-down tick<br/>(every scale_down_interval)"] --> Lock["Acquire distributed lock"]
+    Lock --> Idle["Query Redis for idle jobs<br/>(activity score < now − idle_timeout)"]
+    Idle -->|No idle jobs| Done["Sleep until next tick"]
+    Idle -->|Found idle jobs| Loop["For each idle job"]
+    Loop --> InFlight{"InFlightTracker<br/>has_in_flight?"}
+    InFlight -->|Yes| Refresh["Refresh activity<br/>→ skip"]
+    InFlight -->|No| Probe{"Traefik traffic probe<br/>request delta > 0?"}
+    Probe -->|Active traffic| Refresh
+    Probe -->|No traffic| Scale["Scale job to count=0"]
+    Scale --> Invalidate["Invalidate coordinator cache"]
+    Invalidate --> MarkDormant["Mark dormant"]
+    Refresh --> Loop
+    MarkDormant --> Loop
 ```
 
 **nscale** is a single Rust binary composed of seven internal crates:
 
 | Crate | Purpose |
 |-------|---------|
-| `nscale-core` | Shared types, config (figment), traits |
-| `nscale-nomad` | Nomad API client — scale up/down, allocation discovery |
+| `nscale-core` | Shared types, config (Figment), traits, `InFlightTracker` |
+| `nscale-nomad` | Nomad API client — scale up/down, event stream |
 | `nscale-consul` | Consul catalog — health checks, service discovery |
-| `nscale-store` | Redis activity store and job registry |
-| `nscale-proxy` | Reverse proxy with retry-on-502 and cache invalidation |
+| `nscale-store` | Redis activity store (sorted set) and job registry |
+| `nscale-proxy` | Reverse proxy with in-flight tracking and heartbeat |
 | `nscale-waker` | Wake coordinator — request coalescing, state machine |
-| `nscale-scaler` | Scale-down controller with Traefik traffic probe |
+| `nscale-scaler` | Scale-down controller with traffic probe + in-flight guard |
 
 ## Features
 
 - **Wake-on-request** — Dormant services are started automatically when traffic arrives
 - **Request coalescing** — Concurrent requests for the same service share a single wake cycle
-- **Reverse proxy** — First request is proxied through nscale; subsequent requests go directly via Traefik
-- **Idle detection** — Services with no recent activity are scaled to zero
-- **Traffic probe** — Scrapes Traefik Prometheus metrics to prevent scaling down services with active traffic
+- **In-flight protection** — RAII-based `InFlightTracker` with heartbeat prevents scale-down during active requests
+- **Heartbeat activity** — Long-running requests refresh activity every `idle_timeout / 3`, surviving any idle window
+- **Reverse proxy** — All requests (cold and warm path) route through nscale for full visibility
+- **Idle detection** — Services with no recent activity are scaled to zero via Redis sorted set
+- **Traffic probe** — Scrapes Traefik Prometheus metrics as a secondary guard against scaling down active services
 - **Retry with cache invalidation** — On upstream failure, invalidates stale endpoints and retries the full wake cycle
+- **Nomad event stream** — Reacts to allocation lifecycle events for instant state transitions
 - **Active-deployment tolerance** — Gracefully handles Nomad 400 "scaling blocked due to active deployment"
 - **Bounded concurrency** — Configurable limit on simultaneous Nomad scale operations
 
@@ -72,19 +158,24 @@ docker compose up -d
 Register a sample job:
 
 ```bash
-# Submit the echo service (starts dormant at count=0)
+# Submit the echo service
 nomad job run jobs/echo-s2z.nomad
 
-# Register it with nscale
+# Register it with nscale (seeds activity for idle detection)
 curl -X POST http://localhost:9090/admin/registry \
   -H 'Content-Type: application/json' \
-  -d '{"job_id": "echo-s2z", "host": "echo.localhost", "service_name": "echo-s2z"}'
+  -d '{
+    "job_id": "echo-s2z",
+    "service_name": "echo-s2z",
+    "endpoint": "http://echo-s2z.localhost",
+    "nomad_group": "main"
+  }'
 ```
 
 Send a request — nscale wakes the service and proxies the response:
 
 ```bash
-curl -H "Host: echo-s2z.localhost" http://localhost:8080/
+curl -H "Host: echo-s2z.localhost" http://localhost:80/
 ```
 
 ### Build from source
@@ -103,7 +194,7 @@ docker run -p 8080:8080 -p 9090:9090 nscale
 
 ## Configuration
 
-nscale uses [figment](https://docs.rs/figment) for layered configuration:
+nscale uses [Figment](https://docs.rs/figment) for layered configuration:
 **Environment variables > TOML file > Defaults**.
 
 ### TOML (`config/default.toml`)
@@ -136,7 +227,8 @@ request_buffer_size  = 1000
 
 ### Environment variables
 
-All settings can be overridden with `NSCALE_` prefixed env vars:
+All settings can be overridden with `NSCALE_` prefixed env vars.
+Nested keys use **double underscores** (Figment `.split("__")`).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -155,21 +247,110 @@ All settings can be overridden with `NSCALE_` prefixed env vars:
 | `NSCALE_TRAEFIK__PROVIDER` | — | Traefik provider name for metric labels |
 | `RUST_LOG` | `info,nscale=debug` | Tracing filter |
 
+## Traefik Integration
+
+nscale requires specific Traefik configuration to ensure all traffic flows through it.
+
+### Static config (`traefik.yml`)
+
+```yaml
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+  consulCatalog:
+    exposedByDefault: false
+    strictChecks:
+      - "passing"
+      - "warning"
+```
+
+> **Important:** `strictChecks` must be a list of health status strings, not a boolean.
+> Setting `strictChecks: true` is silently interpreted as the literal string `"true"`,
+> causing all ConsulCatalog services to be rejected.
+
+### Dynamic config (`dynamic.yml`)
+
+```yaml
+http:
+  routers:
+    s2z-fallback:
+      rule: "HostRegexp(`^[a-z0-9-]+\\.localhost$`)"
+      priority: 1
+      entryPoints: [http]
+      service: s2z-nscale
+
+  services:
+    s2z-nscale:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: "http://nscale:8080"
+```
+
+### Nomad job tags
+
+Services must route through nscale on both cold and warm paths.
+Use `service=s2z-nscale@file` to point the ConsulCatalog router at nscale:
+
+```hcl
+service {
+  name     = "my-service"
+  provider = "consul"
+  port     = "http"
+
+  tags = [
+    "traefik.enable=true",
+    "traefik.http.routers.my-service.rule=Host(`my-service.localhost`)",
+    "traefik.http.routers.my-service.entryPoints=http",
+    "traefik.http.routers.my-service.service=s2z-nscale@file",
+  ]
+
+  check {
+    type     = "http"
+    path     = "/"
+    interval = "2s"
+    timeout  = "1s"
+  }
+}
+```
+
+This creates two routes to nscale:
+
+| Route | Provider | Priority | When active |
+|-------|----------|----------|-------------|
+| `my-service@consulcatalog` | ConsulCatalog | 30 | Service is running (healthy in Consul) |
+| `s2z-fallback@file` | File | 1 | Always (catches dormant services) |
+
 ## Admin API
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/healthz` | Liveness check |
 | `GET` | `/readyz` | Readiness check (verifies Redis) |
-| `POST` | `/admin/registry` | Register a single job |
-| `POST` | `/admin/registry/sync` | Bulk-sync all job registrations |
+| `POST` | `/admin/registry` | Register a single job (seeds activity) |
+| `POST` | `/admin/registry/sync` | Bulk-sync all job registrations (seeds activity) |
+
+### Registration payload
+
+```json
+{
+  "job_id": "my-service",
+  "service_name": "my-service",
+  "endpoint": "http://my-service.localhost",
+  "nomad_group": "main"
+}
+```
+
+Registration seeds an activity timestamp in Redis so the scaler can detect the job
+as idle once `idle_timeout` expires. Without this, registered jobs would never be
+discovered by the scale-down controller.
 
 ## Testing
 
 ### Unit tests
 
 ```bash
-cargo test --workspace
+cargo nextest run --workspace
 ```
 
 ### Integration / stress tests (k6)
@@ -177,31 +358,74 @@ cargo test --workspace
 ```bash
 cd integration
 
-# Cold-start latency
-./test.sh                        # basic test
-K6_SCRIPT=k6/coldstart.js ./test.sh
+# Multi-service chaos (50 services + random kills)
+docker compose --profile stress run --rm \
+  -e NSCALE_JOB_COUNT=50 \
+  -e NSCALE_DURATION=90s \
+  k6 run /scripts/multi-service.js
+```
 
-# Load test
-K6_SCRIPT=k6/load.js ./test.sh
+### Multi-job management
 
-# Storm (concurrent cold starts)
-K6_SCRIPT=k6/storm.js ./test.sh
+```bash
+cd integration
 
-# Multi-service chaos
-./stress-test.sh                 # 50 services + chaos killing
+# Submit and register 50 jobs
+bash scripts/multi-job.sh submit 50
+
+# Check status
+bash scripts/multi-job.sh status 50
+
+# Teardown
+bash scripts/multi-job.sh teardown 50
 ```
 
 ## How It Works
 
-1. **Dormant state** — A Nomad job is registered with nscale at `count = 0`. Traefik has no healthy backend, so requests fall through to nscale via an error-fallback middleware.
+### 1. Registration
 
-2. **Wake cycle** — nscale receives the request, looks up the job in its registry, and calls `POST /v1/job/{id}/scale` to Nomad. It then polls Consul health checks until a healthy allocation appears.
+A Nomad job is registered via the admin API. nscale stores the job in Redis and
+seeds an initial activity timestamp. The job can be at any count — nscale will
+scale it down once idle_timeout expires if there's no traffic.
 
-3. **Proxy** — The first request is proxied through nscale to the newly healthy backend. The wake coordinator caches the endpoint so concurrent requests share the same wake cycle.
+### 2. Cold-start wake
 
-4. **Direct routing** — Once the service is healthy in Consul, Traefik routes subsequent requests directly — nscale is out of the data path.
+When all allocations are stopped, the ConsulCatalog route disappears. Traefik
+falls through to the `s2z-fallback` route (priority 1) → nscale. nscale looks
+up the job in its registry, calls Nomad to scale up, polls Consul for a healthy
+endpoint, then proxies the original request.
 
-5. **Scale down** — The scale-down controller periodically scans Redis for idle services. Before scaling down, it checks the Traefik traffic probe to ensure there's no active traffic. If the service is truly idle, it scales the Nomad job to `count = 0` and invalidates the coordinator cache.
+### 3. Warm-path proxy
+
+When the service is healthy, Traefik creates a ConsulCatalog route (priority 30)
+that also points to `s2z-nscale@file`. The request still flows through nscale,
+which tracks it with `InFlightTracker`, spawns a heartbeat, and proxies to the
+real backend discovered via Consul.
+
+### 4. In-flight protection
+
+Each proxied request increments an atomic counter via `InFlightTracker.track()`,
+returning an RAII guard that decrements on drop. A background heartbeat task
+refreshes activity in Redis every `idle_timeout / 3`. The scale-down controller
+checks `has_in_flight()` before any scale operation — if requests are active,
+it refreshes activity and skips.
+
+### 5. Scale down
+
+The scale-down controller runs a periodic sweep:
+
+1. Acquire distributed lock in Redis
+2. Query the activity sorted set for jobs with score < `now - idle_timeout`
+3. For each idle job, check `InFlightTracker` (in-flight requests block scale-down)
+4. Check Traefik traffic probe (request counter delta)
+5. If truly idle, scale Nomad job to `count = 0`
+6. Invalidate the coordinator cache and mark dormant
+
+### 6. Nomad event stream
+
+nscale subscribes to Nomad's allocation event stream. When allocations transition
+to running, it records activity. When they stop, it marks the job dormant and
+clears the coordinator cache — enabling instant state transitions without polling.
 
 ## Project Structure
 

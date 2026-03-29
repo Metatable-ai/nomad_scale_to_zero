@@ -110,11 +110,15 @@ pub struct PortMapping {
 }
 
 /// Nomad event stream types.
+///
+/// Nomad sends heartbeat frames as `{}` to keep the connection alive,
+/// so both `index` and `events` must tolerate missing fields.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct EventStreamFrame {
     #[serde(default)]
     pub events: Vec<EventEnvelope>,
+    #[serde(default)]
     pub index: u64,
 }
 

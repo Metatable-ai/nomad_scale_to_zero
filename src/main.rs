@@ -1,26 +1,29 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::{any, get, post},
-    Json, Router,
 };
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use nscale_consul::client::ConsulClient;
 use nscale_core::config::Config;
+use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::JobRegistration;
 use nscale_core::traits::ActivityStore;
 use nscale_nomad::client::NomadClient;
-use nscale_proxy::handler::{proxy_handler, AppState};
+use nscale_nomad::events::{EventStreamConfig, start_event_stream};
+use nscale_proxy::handler::{AppState, proxy_handler};
 use nscale_proxy::middleware::ActivityLayer;
 use nscale_scaler::controller::ScaleDownController;
+use nscale_scaler::event_processor::EventProcessor;
 use nscale_scaler::traffic_probe::TrafficProbe;
 use nscale_store::activity::RedisActivityStore;
 use nscale_store::registry::JobRegistry;
@@ -89,10 +92,19 @@ async fn main() {
         .build()
         .expect("failed to build HTTP client");
 
+    // ── In-flight request tracker (shared between proxy and scaler) ──
+    let in_flight = InFlightTracker::new();
+
+    // Heartbeat interval: refresh activity every idle_timeout / 3 during long requests
+    let heartbeat_interval = config.scaling.idle_timeout() / 3;
+
     let app_state = AppState {
         coordinator: coordinator.clone(),
         registry: registry.clone(),
         http_client,
+        in_flight: in_flight.clone(),
+        activity_store: activity_store.clone(),
+        heartbeat_interval,
     };
 
     let cancel = CancellationToken::new();
@@ -110,11 +122,31 @@ async fn main() {
         registry.clone(),
         coordinator.clone(),
         traffic_probe,
+        in_flight.clone(),
         config.scaling.idle_timeout(),
         config.scaling.scale_down_interval(),
         cancel.clone(),
     );
     let scaler_handle = tokio::spawn(scaler.run());
+
+    // ── Nomad event stream ───────────────────────────────
+    let event_rx = start_event_stream(
+        EventStreamConfig {
+            nomad_addr: config.nomad.addr.clone(),
+            nomad_token: config.nomad.token.clone(),
+            topics: vec!["Allocation".to_string()],
+            initial_index: 0,
+        },
+        cancel.clone(),
+    );
+
+    let event_processor = EventProcessor::new(
+        coordinator.clone(),
+        activity_store.clone(),
+        registry.clone(),
+    );
+    let event_handle = tokio::spawn(event_processor.run(event_rx));
+    info!("nomad event stream consumer started");
 
     // ── Proxy router ─────────────────────────────────────
     let proxy_router = Router::new()
@@ -126,6 +158,7 @@ async fn main() {
     // ── Admin router ─────────────────────────────────────
     let admin_state = AdminState {
         registry: registry.clone(),
+        activity_store: activity_store.clone(),
     };
 
     let admin_router = Router::new()
@@ -164,8 +197,9 @@ async fn main() {
         }
     }
 
-    // Wait for scaler to finish
+    // Wait for background tasks to finish
     let _ = scaler_handle.await;
+    let _ = event_handle.await;
     info!("nscale shut down");
 }
 
@@ -174,6 +208,7 @@ async fn main() {
 #[derive(Clone)]
 struct AdminState {
     registry: Arc<JobRegistry>,
+    activity_store: Arc<dyn ActivityStore>,
 }
 
 async fn healthz() -> &'static str {
@@ -183,11 +218,7 @@ async fn healthz() -> &'static str {
 async fn readyz(State(state): State<AdminState>) -> impl IntoResponse {
     match state.registry.list_all().await {
         Ok(_) => (StatusCode::OK, "ready").into_response(),
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("not ready: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("not ready: {e}")).into_response(),
     }
 }
 
@@ -197,6 +228,10 @@ async fn admin_register(
 ) -> impl IntoResponse {
     match state.registry.register(&reg).await {
         Ok(()) => {
+            // Seed activity so the scaler can detect this job as idle later.
+            if let Err(e) = state.activity_store.record_activity(&reg.job_id).await {
+                error!(job_id = %reg.job_id, error = %e, "failed to seed activity");
+            }
             info!(job_id = %reg.job_id, "registered job via admin API");
             (StatusCode::CREATED, "registered").into_response()
         }
@@ -216,7 +251,12 @@ async fn admin_sync(
 
     for reg in &registrations {
         match state.registry.register(reg).await {
-            Ok(()) => ok += 1,
+            Ok(()) => {
+                if let Err(e) = state.activity_store.record_activity(&reg.job_id).await {
+                    error!(job_id = %reg.job_id, error = %e, "failed to seed activity during sync");
+                }
+                ok += 1;
+            }
             Err(e) => {
                 error!(job_id = %reg.job_id, error = %e, "failed to register during sync");
                 failed += 1;
@@ -224,7 +264,12 @@ async fn admin_sync(
         }
     }
 
-    info!(ok, failed, total = registrations.len(), "registry sync complete");
+    info!(
+        ok,
+        failed,
+        total = registrations.len(),
+        "registry sync complete"
+    );
     (
         StatusCode::OK,
         Json(serde_json::json!({

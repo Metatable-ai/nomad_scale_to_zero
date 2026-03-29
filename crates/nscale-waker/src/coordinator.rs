@@ -8,7 +8,7 @@ use nscale_core::error::{NscaleError, Result};
 use nscale_core::job::{Endpoint, JobId, JobRegistration};
 use nscale_core::traits::{Orchestrator, ServiceDiscovery};
 
-use crate::state::{WakeResult, WakeState, STATE_DORMANT, STATE_READY, STATE_WAKING};
+use crate::state::{STATE_DORMANT, STATE_READY, STATE_WAKING, WakeResult, WakeState};
 
 /// Coordinates wake-ups with request coalescing.
 /// Multiple concurrent requests for the same dormant job result in a single scale-up call.
@@ -143,8 +143,7 @@ impl WakeCoordinator {
                                         endpoint = %endpoint,
                                         "job woke up successfully"
                                     );
-                                    endpoints
-                                        .insert(reg_clone.job_id.0.clone(), endpoint.clone());
+                                    endpoints.insert(reg_clone.job_id.0.clone(), endpoint.clone());
                                     state_clone.set_ready();
                                     let _ = notify.send(WakeResult::Ready(endpoint));
                                 }
@@ -226,9 +225,10 @@ async fn run_wake_task(
     timeout: Duration,
 ) -> Result<Endpoint> {
     // Acquire semaphore to bound concurrent Nomad API calls
-    let _permit = semaphore.acquire().await.map_err(|_| {
-        NscaleError::Nomad("wake semaphore closed".to_string())
-    })?;
+    let _permit = semaphore
+        .acquire()
+        .await
+        .map_err(|_| NscaleError::Nomad("wake semaphore closed".to_string()))?;
 
     debug!(job_id = %reg.job_id, group = %reg.nomad_group, "scaling up job");
     orchestrator
@@ -286,11 +286,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ServiceDiscovery for MockDiscovery {
-        async fn register_fallback(
-            &self,
-            _name: &ServiceName,
-            _ep: &Endpoint,
-        ) -> Result<()> {
+        async fn register_fallback(&self, _name: &ServiceName, _ep: &Endpoint) -> Result<()> {
             Ok(())
         }
         async fn deregister_fallback(&self, _name: &ServiceName) -> Result<()> {
@@ -349,9 +345,9 @@ mod tests {
         for _ in 0..20 {
             let coord = coord.clone();
             let reg = reg.clone();
-            handles.push(tokio::spawn(async move {
-                coord.ensure_running(&reg).await
-            }));
+            handles.push(tokio::spawn(
+                async move { coord.ensure_running(&reg).await },
+            ));
         }
 
         for handle in handles {

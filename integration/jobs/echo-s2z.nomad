@@ -49,7 +49,7 @@ job "echo-s2z" {
           "traefik.enable=true",
           "traefik.http.routers.echo-s2z.rule=Host(`echo-s2z.localhost`)",
           "traefik.http.routers.echo-s2z.entryPoints=http",
-          "traefik.http.routers.echo-s2z.middlewares=s2z-error-fallback@file",
+          "traefik.http.routers.echo-s2z.service=s2z-nscale@file",
         ]
 
         check {

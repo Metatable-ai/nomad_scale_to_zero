@@ -2,8 +2,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use figment::{
-    providers::{Env, Format, Serialized, Toml},
     Figment,
+    providers::{Env, Format, Serialized, Toml},
 };
 use serde::{Deserialize, Serialize};
 
@@ -153,6 +153,7 @@ impl Default for Config {
 
 impl Config {
     /// Load configuration from: defaults → config/default.toml → NSCALE_* env vars.
+    #[allow(clippy::result_large_err)]
     pub fn load() -> std::result::Result<Self, figment::Error> {
         Figment::from(Serialized::defaults(Config::default()))
             .merge(Toml::file("config/default.toml").nested())

@@ -78,34 +78,33 @@ impl NomadClient {
 
     fn extract_endpoint(alloc: &Allocation) -> Option<Endpoint> {
         // Try allocated_resources.shared.ports first (preferred in newer Nomad)
-        if let Some(ref allocated) = alloc.allocated_resources {
-            if let Some(ref shared) = allocated.shared {
-                if let Some(port) = shared.ports.first() {
-                    let host = if port.host_ip.is_empty() || port.host_ip == "0.0.0.0" {
-                        // Fallback to network IP
-                        shared
-                            .networks
-                            .first()
-                            .map(|n| n.ip.clone())
-                            .unwrap_or_else(|| "127.0.0.1".to_string())
-                    } else {
-                        port.host_ip.clone()
-                    };
-                    return Some(Endpoint::new(host, port.value));
-                }
-            }
+        if let Some(ref allocated) = alloc.allocated_resources
+            && let Some(ref shared) = allocated.shared
+            && let Some(port) = shared.ports.first()
+        {
+            let host = if port.host_ip.is_empty() || port.host_ip == "0.0.0.0" {
+                // Fallback to network IP
+                shared
+                    .networks
+                    .first()
+                    .map(|n| n.ip.clone())
+                    .unwrap_or_else(|| "127.0.0.1".to_string())
+            } else {
+                port.host_ip.clone()
+            };
+            return Some(Endpoint::new(host, port.value));
         }
 
         // Fallback to resources.networks
-        if let Some(ref resources) = alloc.resources {
-            if let Some(net) = resources.networks.first() {
-                let port = net
-                    .dynamic_ports
-                    .first()
-                    .or(net.reserved_ports.first())
-                    .map(|p| p.value)?;
-                return Some(Endpoint::new(&net.ip, port));
-            }
+        if let Some(ref resources) = alloc.resources
+            && let Some(net) = resources.networks.first()
+        {
+            let port = net
+                .dynamic_ports
+                .first()
+                .or(net.reserved_ports.first())
+                .map(|p| p.value)?;
+            return Some(Endpoint::new(&net.ip, port));
         }
 
         None
@@ -140,7 +139,9 @@ impl Orchestrator for NomadClient {
             // This means the job is already scaling up — just proceed to
             // wait for the healthy endpoint (matches Go activator behavior).
             if status.as_u16() == 400
-                && body.to_lowercase().contains("scaling blocked due to active deployment")
+                && body
+                    .to_lowercase()
+                    .contains("scaling blocked due to active deployment")
             {
                 info!(job_id = %job_id, "scale-up blocked by active deployment, proceeding to wait");
                 return Ok(());
@@ -239,9 +240,7 @@ mod tests {
             .await;
 
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
-        let result = client
-            .scale_up(&"test-job".into(), "web", 1)
-            .await;
+        let result = client.scale_up(&"test-job".into(), "web", 1).await;
         assert!(result.is_ok());
     }
 
@@ -382,7 +381,10 @@ mod tests {
 
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.scale_up(&"test-job".into(), "web", 1).await;
-        assert!(result.is_ok(), "active deployment should not be treated as error");
+        assert!(
+            result.is_ok(),
+            "active deployment should not be treated as error"
+        );
     }
 
     #[tokio::test]
@@ -392,8 +394,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/job/test-job/scale"))
             .respond_with(
-                ResponseTemplate::new(400)
-                    .set_body_string("job not found or invalid group"),
+                ResponseTemplate::new(400).set_body_string("job not found or invalid group"),
             )
             .expect(1)
             .mount(&mock_server)

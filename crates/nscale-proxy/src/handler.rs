@@ -1,14 +1,17 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     body::Body,
     extract::State,
-    http::{header, Request, StatusCode},
+    http::{Request, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use tracing::{error, info, instrument, warn};
 
+use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::JobId;
+use nscale_core::traits::ActivityStore;
 use nscale_store::registry::JobRegistry;
 use nscale_waker::coordinator::WakeCoordinator;
 
@@ -20,6 +23,10 @@ pub struct AppState {
     pub coordinator: Arc<WakeCoordinator>,
     pub registry: Arc<JobRegistry>,
     pub http_client: reqwest::Client,
+    pub in_flight: InFlightTracker,
+    pub activity_store: Arc<dyn ActivityStore>,
+    /// Interval for refreshing activity during long-running proxied requests.
+    pub heartbeat_interval: Duration,
 }
 
 /// Main request handler.
@@ -29,10 +36,7 @@ pub struct AppState {
 /// 3. Ensure the backing job is running (wake if dormant).
 /// 4. Forward the request to the healthy backend.
 #[instrument(skip_all, fields(host))]
-pub async fn proxy_handler(
-    State(state): State<AppState>,
-    req: Request<Body>,
-) -> Response {
+pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> Response {
     // --- 1. Extract service identifier from Host header ---
     let host_value = match req.headers().get(header::HOST) {
         Some(v) => v.to_str().unwrap_or_default().to_string(),
@@ -52,7 +56,7 @@ pub async fn proxy_handler(
         .unwrap_or(&host_value)
         .to_string();
 
-    tracing::Span::current().record("host", &service_key.as_str());
+    tracing::Span::current().record("host", service_key.as_str());
 
     // --- 2. Look up job registration ---
     let job_id = JobId(service_key.clone());
@@ -73,8 +77,7 @@ pub async fn proxy_handler(
         Ok(ep) => ep,
         Err(e) => {
             error!(job_id = %job_id, error = %e, "wake failed");
-            return (StatusCode::SERVICE_UNAVAILABLE, format!("wake error: {e}"))
-                .into_response();
+            return (StatusCode::SERVICE_UNAVAILABLE, format!("wake error: {e}")).into_response();
         }
     };
 
@@ -84,8 +87,35 @@ pub async fn proxy_handler(
         "routing request to backend"
     );
 
+    // --- Track in-flight request so the scale-down controller skips this job ---
+    let _in_flight_guard = state.in_flight.track(&job_id.0);
+
+    // Spawn a heartbeat that refreshes activity while the proxy request is in-flight.
+    // This prevents the scale-down controller from treating the job as idle during
+    // long-running requests.
+    let heartbeat_store = state.activity_store.clone();
+    let heartbeat_job = job_id.clone();
+    let heartbeat_interval = state.heartbeat_interval;
+    let heartbeat_cancel = tokio_util::sync::CancellationToken::new();
+    let heartbeat_cancel_clone = heartbeat_cancel.clone();
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(heartbeat_interval);
+        ticker.tick().await; // first tick is immediate, skip it
+        loop {
+            tokio::select! {
+                _ = heartbeat_cancel_clone.cancelled() => break,
+                _ = ticker.tick() => {
+                    if let Err(e) = heartbeat_store.record_activity(&heartbeat_job).await {
+                        warn!(job_id = %heartbeat_job, error = %e, "activity heartbeat failed");
+                    }
+                }
+            }
+        }
+    });
+
     // --- 4. Forward request to backend; retry once on connection failure ---
-    match forward_request(&state.http_client, &endpoint, req).await {
+    let result = match forward_request(&state.http_client, &endpoint, req).await {
         Ok(resp) => resp,
         Err(_status) => {
             // Backend unreachable — stale cache. Invalidate and re-wake.
@@ -100,7 +130,11 @@ pub async fn proxy_handler(
                 Ok(ep) => ep,
                 Err(e) => {
                     error!(job_id = %job_id, error = %e, "retry wake failed");
-                    return (StatusCode::SERVICE_UNAVAILABLE, format!("retry wake error: {e}"))
+                    heartbeat_cancel.cancel();
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("retry wake error: {e}"),
+                    )
                         .into_response();
                 }
             };
@@ -123,5 +157,10 @@ pub async fn proxy_handler(
                 Err(status) => status.into_response(),
             }
         }
-    }
+    };
+
+    // Stop the heartbeat — request processing is done.
+    heartbeat_cancel.cancel();
+
+    result
 }

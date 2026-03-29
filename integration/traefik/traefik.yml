@@ -29,9 +29,11 @@ providers:
     watch: true
     refreshInterval: 1s
     defaultRule: "Host(`{{ .Name }}.localhost`)"
-    strictChecks: true
+    strictChecks:
+      - "passing"
+      - "warning"
 
 serversTransport:
   forwardingTimeouts:
     dialTimeout: 1s
-    responseHeaderTimeout: 3s
+    responseHeaderTimeout: 60s

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 nscale-core = { path = "../nscale-core" }
+nscale-nomad = { path = "../nscale-nomad" }
 nscale-waker = { path = "../nscale-waker" }
 nscale-store = { path = "../nscale-store" }
 tokio = { workspace = true }

@@ -46,7 +46,12 @@ impl WakeState {
     /// Returns true if this caller won the race (i.e., should start the wake task).
     pub fn try_start_wake(&self) -> bool {
         self.status
-            .compare_exchange(STATE_DORMANT, STATE_WAKING, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                STATE_DORMANT,
+                STATE_WAKING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 

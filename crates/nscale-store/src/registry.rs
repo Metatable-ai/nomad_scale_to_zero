@@ -18,8 +18,7 @@ impl JobRegistry {
 
     #[instrument(skip(self), fields(job_id = %reg.job_id))]
     pub async fn register(&self, reg: &JobRegistration) -> Result<()> {
-        let value =
-            serde_json::to_string(reg).map_err(|e| NscaleError::Store(e.to_string()))?;
+        let value = serde_json::to_string(reg).map_err(|e| NscaleError::Store(e.to_string()))?;
         let _: () = self
             .client
             .hset(REGISTRY_KEY, (reg.job_id.0.as_str(), value.as_str()))

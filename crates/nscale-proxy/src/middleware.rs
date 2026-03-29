@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::http::{header, Request};
+use axum::http::{Request, header};
 use tower::{Layer, Service};
 use tracing::{debug, warn};
 
@@ -78,9 +78,19 @@ where
         let future = self.inner.call(req);
 
         Box::pin(async move {
+            // Record activity at request START so the idle timer is pushed
+            // forward immediately — this protects against scale-down during
+            // long-running requests.
+            if let Some(ref id) = job_id {
+                let job = JobId(id.clone());
+                if let Err(e) = store.record_activity(&job).await {
+                    warn!(job_id = %id, error = %e, "failed to record start activity");
+                }
+            }
+
             let response = future.await?;
 
-            // Record activity asynchronously (fire-and-forget)
+            // Also record activity at request END (fire-and-forget)
             if let Some(id) = job_id {
                 let store = store.clone();
                 tokio::spawn(async move {

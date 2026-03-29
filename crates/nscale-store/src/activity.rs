@@ -30,8 +30,7 @@ pub struct RedisActivityStore {
 
 impl RedisActivityStore {
     pub async fn new(redis_url: &str) -> Result<Self> {
-        let config =
-            Config::from_url(redis_url).map_err(|e| NscaleError::Store(e.to_string()))?;
+        let config = Config::from_url(redis_url).map_err(|e| NscaleError::Store(e.to_string()))?;
         let client = Builder::from_config(config)
             .build()
             .map_err(|e| NscaleError::Store(e.to_string()))?;

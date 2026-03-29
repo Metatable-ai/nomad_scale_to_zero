@@ -104,12 +104,12 @@ fn parse_service_requests_total(body: &str, service_label: &str) -> u64 {
         }
         // Match lines like:
         //   traefik_service_requests_total{code="200",method="GET",...,service="echo-s2z@consulcatalog"} 42
-        if line.starts_with("traefik_service_requests_total{") && line.contains(&needle) {
-            if let Some(value_str) = line.rsplit_once(' ').map(|(_, v)| v) {
-                if let Ok(v) = value_str.parse::<f64>() {
-                    total += v as u64;
-                }
-            }
+        if line.starts_with("traefik_service_requests_total{")
+            && line.contains(&needle)
+            && let Some(value_str) = line.rsplit_once(' ').map(|(_, v)| v)
+            && let Ok(v) = value_str.parse::<f64>()
+        {
+            total += v as u64;
         }
     }
 

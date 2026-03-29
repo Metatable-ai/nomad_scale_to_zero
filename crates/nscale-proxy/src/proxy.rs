@@ -32,8 +32,15 @@ pub async fn forward_request(
         let n = name.as_str();
         if matches!(
             n,
-            "host" | "connection" | "keep-alive" | "transfer-encoding" | "te" | "trailer"
-            | "upgrade" | "proxy-authorization" | "proxy-connection"
+            "host"
+                | "connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "te"
+                | "trailer"
+                | "upgrade"
+                | "proxy-authorization"
+                | "proxy-connection"
         ) {
             continue;
         }
@@ -51,7 +58,8 @@ pub async fn forward_request(
     })?;
 
     // Convert reqwest response back to axum response
-    let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_builder = Response::builder().status(status);
 
     for (name, value) in response.headers() {
