@@ -1,385 +1,459 @@
-<!--
-// Copyright 2026 Metatable Inc.
-// SPDX-License-Identifier: Apache-2.0
--->
+# nscale — Nomad Scale-to-Zero
 
-# Nomad Scale-to-Zero
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-> **Automatic scale-to-zero for HashiCorp Nomad workloads with Traefik and wake-on-request**
+Transparent scale-to-zero and wake-on-request for [HashiCorp Nomad](https://www.nomadproject.io/) services.
+**nscale** sits between Traefik and your Nomad jobs — when traffic arrives for a dormant service,
+it wakes the job, proxies the request, and scales idle services back to zero when they go quiet.
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)](https://go.dev/)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+## Architecture
 
-Scale-to-zero allows Nomad services to be scaled down to **0 allocations when idle**, then automatically **woken up on the next request**. This dramatically reduces infrastructure costs for services with intermittent or unpredictable traffic patterns while maintaining instant availability.
+```mermaid
+graph LR
+    Client([Client]) -->|request| Traefik
 
-## ✨ Features
+    subgraph Traefik["Traefik (reverse proxy)"]
+        CC["ConsulCatalog route<br/>priority 30"]
+        Fallback["s2z-fallback route<br/>priority 1"]
+    end
 
-- **🚀 Automatic Wake-on-Request**: Services scale from 0 to N when traffic arrives via Traefik middleware
-- **💤 Intelligent Idle Detection**: Configurable idle timeouts automatically scale down unused services
-- **🔄 Dead Job Revival**: Automatically restore and start stopped/purged jobs on first request
-- **🔐 ACL-Ready**: First-class support for Nomad and Consul ACLs with token management
-- **📊 Flexible Storage**: Choose between Consul KV (simple) or Redis (high-performance) backends
-- **⚡ Production-Ready**: Minimal configuration, battle-tested in production environments
-- **🎯 Per-Service Configuration**: Fine-grained control via job metadata and Traefik tags
+    CC -->|"service=s2z-nscale#64;file"| nscale
+    Fallback -->|"service=s2z-nscale"| nscale
 
-## 🏗️ Architecture
+    nscale -->|proxy| Backend["Nomad job<br/>(healthy allocation)"]
+    nscale -->|scale up| Nomad
+    nscale -->|health poll| Consul
+    nscale -->|activity + registry| Redis
 
-This implementation combines several components:
-
-- **Traefik** as the ingress proxy
-- **ScaleWaker** - a custom Traefik middleware plugin to wake services
-- **idle-scaler** - an agent to scale services back down after idle timeout
-- **activity-store** - Consul KV or Redis backend to track activity and store job specs
-
-## 🚀 Quick Start
-
-The fastest way to try scale-to-zero locally is with the all-in-one demo script:
-
-```bash
-./local-test/scripts/start-local-with-acl.sh
+    Nomad -->|registers service| Consul
+    Consul -->|service discovery| Traefik
 ```
 
-This script:
-- Starts Consul + Nomad in dev mode **with ACLs enabled**
-- Creates least-privilege tokens
-- Starts Traefik with the ScaleWaker plugin
-- Builds and runs the idle-scaler as a Nomad system job
+### Routing paths
 
-### Simple Test
+All traffic for nscale-managed services flows through nscale on **both** the cold and warm paths.
+This ensures nscale has full visibility into in-flight requests and can prevent premature scale-down.
 
-Once the stack is running:
+```mermaid
+graph TD
+    Request([Incoming request]) --> Traefik
 
-```bash
-# 1. Deploy a scale-to-zero enabled job
-nomad job run local-test/sample-jobs/echo-s2z.hcl
+    Traefik -->|"Service UP<br/>CC route (prio 30)"| nscale
+    Traefik -->|"Service DOWN<br/>Fallback (prio 1)"| nscale
 
-# 2. Test the service
-curl -H 'Host: echo-s2z.localhost' http://localhost/
+    nscale -->|Service is running| Proxy["Proxy to backend"]
+    nscale -->|Service is dormant| Wake["Wake → poll Consul → proxy"]
 
-# 3. Scale it down to 0
-nomad job scale echo-s2z main 0
-
-# 4. Hit it again - it wakes back up automatically!
-curl -H 'Host: echo-s2z.localhost' http://localhost/
+    Proxy --> Backend["Nomad allocation"]
+    Wake -->|scale up| Nomad["Nomad API"]
+    Nomad --> Consul["Consul health check"]
+    Consul -->|healthy| Proxy
 ```
 
-**See [LOCAL_TESTING.md](LOCAL_TESTING.md) for detailed development setup and testing guide.**
+**Key insight:** ConsulCatalog routes use `traefik.http.routers.<name>.service=s2z-nscale@file`
+to point back to nscale instead of directly to the Nomad allocation. This guarantees nscale
+tracks every request, enabling in-flight protection and heartbeat-based activity recording.
 
-## 🤖 Automation jobs
+### In-flight request protection
 
-Use the dedicated automation wrappers when you want stable evidence-collection entrypoints instead of the generic runners:
+nscale prevents scale-down of services with active long-running requests using an
+`InFlightTracker` with RAII guards and periodic heartbeats:
 
-- `./run-automation-smoke.sh` — fast smoke profile on the minimal topology
-- `./run-automation-prod-profile.sh` — certification / production-shaped profile for readiness evidence
-- `./run-automation-soak.sh` — extended mixed-traffic soak on the certification topology
-- `./run-automation-resilience.sh` — dead-job revival and idle-scaler restart recovery focus
-- `./run-automation-store-pressure.sh` — Docker stress suites for Redis / Consul store pressure
-- `./run-automation-release-gate.sh` — certification-profile release gate that fails on release-gate no-go results
-- `./run-automation-certification.sh` — alias of the prod-profile automation job
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Traefik
+    participant nscale
+    participant Backend
+    participant Scaler
 
-These wrappers still honor the existing `E2E_*` and `STRESS_*` overrides, but they default artifacts to `.e2e-artifacts/<job>/<run-id>/` so runs stay grouped by purpose. Readiness or `/metadata` validation failures now also write per-service bundles under `failures/<service>/<reason>/` with targeted Nomad and Consul evidence. For post-wake diagnosis on the Nomad-managed scaler path, set `E2E_TARGET_IDLE_SCALER_ISOLATION_MODE=stop-after-initial-scale-to-zero` so the harness completes the first scale-to-zero pass, then removes `idle-scaler` and skips later scaler-dependent cleanup phases on purpose. Set `AUTOMATION_PRESET_ONLY=1` to print the resolved preset without starting Docker.
+    Client->>Traefik: GET /slow?delay=60
+    Traefik->>nscale: route via s2z-nscale@file
+    nscale->>nscale: InFlightTracker.track(job_id)
+    nscale->>nscale: record_activity(start)
+    nscale->>Backend: proxy request
 
-## 💡 Use Cases
+    loop Every idle_timeout / 3
+        nscale->>nscale: heartbeat → record_activity
+    end
 
-Scale-to-zero is perfect for:
+    Note over Scaler: Scale-down tick
+    Scaler->>nscale: has_in_flight(job_id)?
+    nscale-->>Scaler: true → skip scale-down
 
-- **Development/Staging Environments**: Dramatically reduce costs for environments used only during business hours
-- **Preview Environments**: PR previews and feature branches that sit idle most of the time
-- **Batch Processing Services**: Jobs triggered by external events (webhooks, cron) with idle periods
-- **Internal Tools**: Admin panels, dashboards, and utilities with sporadic usage
-- **Microservices**: Low-traffic services in a microservices architecture
-- **Multi-Tenant Applications**: Per-customer services that aren't always active
+    Backend-->>nscale: response (after 60s)
+    nscale->>nscale: InFlightGuard dropped
+    nscale->>nscale: record_activity(end)
+    nscale-->>Client: response
 
-### Why Scale-to-Zero?
+    Note over Scaler: Next tick after idle_timeout
+    Scaler->>nscale: has_in_flight(job_id)?
+    nscale-->>Scaler: false
+    Scaler->>Scaler: check traffic probe
+    Scaler->>nscale: scale to zero
+```
 
-Traditional auto-scaling typically scales to a minimum of 1 instance, which still consumes resources 24/7. Scale-to-zero goes further:
+### Scale-down decision flow
 
-- **Reduce costs by 90%+ for idle services**
-- **Maintain instant availability** with automatic wake-on-request
-- **Optimize resource utilization** across your cluster
-- **Simplify operations** with automatic lifecycle management
+```mermaid
+flowchart TD
+    Tick["Scale-down tick<br/>(every scale_down_interval)"] --> Lock["Acquire distributed lock"]
+    Lock --> Idle["Query Redis for idle jobs<br/>(activity score < now − idle_timeout)"]
+    Idle -->|No idle jobs| Done["Sleep until next tick"]
+    Idle -->|Found idle jobs| Loop["For each idle job"]
+    Loop --> InFlight{"InFlightTracker<br/>has_in_flight?"}
+    InFlight -->|Yes| Refresh["Refresh activity<br/>→ skip"]
+    InFlight -->|No| Probe{"Traefik traffic probe<br/>request delta > 0?"}
+    Probe -->|Active traffic| Refresh
+    Probe -->|No traffic| Scale["Scale job to count=0"]
+    Scale --> Invalidate["Invalidate coordinator cache"]
+    Invalidate --> MarkDormant["Mark dormant"]
+    Refresh --> Loop
+    MarkDormant --> Loop
+```
 
-## 📖 How it works
+**nscale** is a single Rust binary composed of seven internal crates:
 
-### Request path (wake-up)
+| Crate | Purpose |
+|-------|---------|
+| `nscale-core` | Shared types, config (Figment), traits, `InFlightTracker` |
+| `nscale-nomad` | Nomad API client — scale up/down, event stream |
+| `nscale-consul` | Consul catalog — health checks, service discovery |
+| `nscale-store` | Redis activity store (sorted set) and job registry |
+| `nscale-proxy` | Reverse proxy with in-flight tracking and heartbeat |
+| `nscale-waker` | Wake coordinator — request coalescing, state machine |
+| `nscale-scaler` | Scale-down controller with traffic probe + in-flight guard |
 
-1. A request arrives at Traefik for `some-service.localhost`.
-2. The **ScaleWaker middleware** determines the target service/job from the request (usually the `Host` header).
-3. If the service is not healthy/registered (typically because it’s scaled to 0):
-   - it calls the **Nomad API** to scale the job group up (usually to 1)
-   - it waits for a healthy Nomad allocation and probes the configured readiness path (default `/healthz`)
-4. It records activity (last request timestamp) in the configured activity store.
-5. The request is proxied to the now-running backend.
+## Features
 
-When Traefik's Prometheus endpoint is enabled, ScaleWaker also emits bounded wake-path metrics:
+- **Wake-on-request** — Dormant services are started automatically when traffic arrives
+- **Request coalescing** — Concurrent requests for the same service share a single wake cycle
+- **In-flight protection** — RAII-based `InFlightTracker` with heartbeat prevents scale-down during active requests
+- **Heartbeat activity** — Long-running requests refresh activity every `idle_timeout / 3`, surviving any idle window
+- **Reverse proxy** — All requests (cold and warm path) route through nscale for full visibility
+- **Idle detection** — Services with no recent activity are scaled to zero via Redis sorted set
+- **Traffic probe** — Scrapes Traefik Prometheus metrics as a secondary guard against scaling down active services
+- **Retry with cache invalidation** — On upstream failure, invalidates stale endpoints and retries the full wake cycle
+- **Nomad event stream** — Reacts to allocation lifecycle events for instant state transitions
+- **Active-deployment tolerance** — Gracefully handles Nomad 400 "scaling blocked due to active deployment"
+- **Bounded concurrency** — Configurable limit on simultaneous Nomad scale operations
 
-- `s2z_traefik_plugin_wake_attempts_total`
-- `s2z_traefik_plugin_wake_outcomes_total{result=...}`
-- `s2z_traefik_plugin_wake_duration_seconds{result=...}`
-
-These metrics intentionally avoid per-service labels; use the structured plugin logs for service/job detail.
-
-### Background path (scale-down)
-
-1. The **idle-scaler** periodically scans for scale-to-zero-enabled jobs.
-2. For each job it reads the last activity timestamp.
-3. If `now - lastActivity > idleTimeout`, it scales the job group down to 0.
-
-## 🏭 Production Deployment
+## Quick Start
 
 ### Prerequisites
 
-- HashiCorp Nomad cluster (1.0+)
-- HashiCorp Consul cluster
-- Traefik (2.9+) as ingress proxy
-- Redis (optional, recommended for large deployments)
+- [Docker](https://docs.docker.com/get-docker/) and Docker Compose
+- [Nomad](https://developer.hashicorp.com/nomad/install) 1.10+
+- [Consul](https://developer.hashicorp.com/consul/install) 1.18+
 
-### Deployment Steps
+### Run with Docker Compose
 
-1. **Deploy the Traefik Plugin**
+The integration stack brings up Nomad, Consul, Redis, Traefik, and nscale:
 
-   **Option A: Local Plugin Installation** (Recommended for now)
+```bash
+cd integration
+docker compose up -d
+```
 
-   Copy the plugin to Traefik's local plugins directory:
+Register a sample job:
 
-   ```bash
-   # Clone the repository
-   git clone https://github.com/Metatable-ai/nomad_scale_to_zero.git
-   
-   # Copy plugin to Traefik plugins directory
-   mkdir -p /path/to/traefik/plugins-local
-   cp -r nomad_scale_to_zero/traefik-plugin /path/to/traefik/plugins-local/
-   ```
+```bash
+# Submit the echo service
+nomad job run jobs/echo-s2z.nomad
 
-   Configure Traefik static configuration:
+# Register it with nscale (seeds activity for idle detection)
+curl -X POST http://localhost:9090/admin/registry \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "job_id": "echo-s2z",
+    "service_name": "echo-s2z",
+    "endpoint": "http://echo-s2z.localhost",
+    "nomad_group": "main"
+  }'
+```
 
-   ```yaml
-   experimental:
-     localPlugins:
-       scalewaker:
-         moduleName: "nomad_scale_to_zero/traefik-plugin"
-   ```
+Send a request — nscale wakes the service and proxies the response:
 
-   **Option B: Plugin Catalog** (Coming soon)
+```bash
+curl -H "Host: echo-s2z.localhost" http://localhost:80/
+```
 
-   > **Note:** Plugin Catalog support requires restructuring this repository to have the plugin code at the root.
-   > This is planned for a future release. For now, use local plugin installation (Option A).
+### Build from source
 
-   Configure environment variables:
+```bash
+cargo build --release
+./target/release/nscale
+```
 
-   ```bash
-   S2Z_NOMAD_ADDR=http://nomad.service.consul:4646
-   S2Z_CONSUL_ADDR=http://consul.service.consul:8500
-   S2Z_ACTIVITY_STORE=redis
-   S2Z_REDIS_ADDR=redis.service.consul:6379
-   S2Z_NOMAD_TOKEN=<your-nomad-token>
-   S2Z_CONSUL_TOKEN=<your-consul-token>
-   ```
+### Docker
 
-2. **Deploy the Idle-Scaler**
+```bash
+docker build -t nscale .
+docker run -p 8080:8080 -p 9090:9090 nscale
+```
 
-   Run the idle-scaler as a Nomad system job:
+## Configuration
 
-   ```bash
-   nomad job run local-test/system-jobs/idle-scaler.hcl
-   ```
+nscale uses [Figment](https://docs.rs/figment) for layered configuration:
+**Environment variables > TOML file > Defaults**.
 
-   Ensure environment variables are set with appropriate tokens.
+### TOML (`config/default.toml`)
 
-3. **Configure Jobs for Scale-to-Zero**
+```toml
+[default]
+listen_addr = "0.0.0.0:8080"
+admin_addr  = "0.0.0.0:9090"
 
-   Add metadata to your job specifications:
+[default.nomad]
+addr        = "http://localhost:4646"
+concurrency = 50
 
-   ```hcl
-   job "my-service" {
-     meta = {
-       "scale-to-zero.enabled"      = "true"
-       "scale-to-zero.idle-timeout" = "300"  # seconds
-       "scale-to-zero.job-spec-kv"  = "scale-to-zero/jobs/my-service"
-     }
-     
-     group "main" {
-       # ... your group config
-       
-       service {
-          tags = [
-            "traefik.enable=true",
-            "traefik.http.routers.myservice.rule=Host(`myservice.example.com`)",
-            "traefik.http.middlewares.scalewaker-myservice.plugin.scalewaker.serviceName=my-service",
-            "traefik.http.middlewares.scalewaker-myservice.plugin.scalewaker.timeout=30s",
-            "traefik.http.middlewares.scalewaker-myservice.plugin.scalewaker.probePath=/healthz",
-            "traefik.http.routers.myservice.middlewares=scalewaker-myservice",
-          ]
-        }
-      }
-    }
-   ```
+[default.consul]
+addr = "http://localhost:8500"
 
-### Production Best Practices
+[default.redis]
+url = "redis://localhost:6379"
 
-- **Use Redis for Storage**: For deployments with 50+ jobs, use Redis instead of Consul KV to reduce Raft pressure
-- **Set Appropriate Timeouts**: Balance cold-start latency against resource savings
-- **Monitor Wake Times**: Track how long services take to become healthy after wake-up
-- **Use ACL Tokens**: Always use least-privilege tokens in production
-- **Test Dead Job Revival**: Verify job specs are stored correctly and can be restored
-- **Split Registration vs Wake Readiness**: Keep Nomad/Consul service checks on a fast local readiness endpoint such as `/readyz`, and let ScaleWaker probe an end-to-end path such as `/healthz` when downstream dependencies matter
+[default.scaling]
+idle_timeout_secs        = 300
+wake_timeout_secs        = 60
+scale_down_interval_secs = 30
+min_scale_down_age_secs  = 120
 
-### ACL Setup
+[default.proxy]
+request_timeout_secs = 30
+request_buffer_size  = 1000
+```
 
-Create dedicated policies for scale-to-zero components:
+### Environment variables
 
-**Nomad Policy** (see `local-test/nomad/scale-to-zero-policy.hcl`):
+All settings can be overridden with `NSCALE_` prefixed env vars.
+Nested keys use **double underscores** (Figment `.split("__")`).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NSCALE_LISTEN_ADDR` | `0.0.0.0:8080` | Proxy listen address |
+| `NSCALE_ADMIN_ADDR` | `0.0.0.0:9090` | Admin/health listen address |
+| `NSCALE_NOMAD__ADDR` | `http://localhost:4646` | Nomad API address |
+| `NSCALE_NOMAD__TOKEN` | — | Nomad ACL token (optional) |
+| `NSCALE_NOMAD__CONCURRENCY` | `50` | Max concurrent Nomad operations |
+| `NSCALE_CONSUL__ADDR` | `http://localhost:8500` | Consul API address |
+| `NSCALE_CONSUL__TOKEN` | — | Consul ACL token (optional) |
+| `NSCALE_REDIS__URL` | `redis://localhost:6379` | Redis connection URL |
+| `NSCALE_SCALING__IDLE_TIMEOUT_SECS` | `300` | Seconds before idle service is scaled down |
+| `NSCALE_SCALING__WAKE_TIMEOUT_SECS` | `60` | Max seconds to wait for a service to become healthy |
+| `NSCALE_SCALING__SCALE_DOWN_INTERVAL_SECS` | `30` | Scale-down sweep interval |
+| `NSCALE_TRAEFIK__METRICS_URL` | — | Traefik Prometheus endpoint (enables traffic probe) |
+| `NSCALE_TRAEFIK__PROVIDER` | — | Traefik provider name for metric labels |
+| `RUST_LOG` | `info,nscale=debug` | Tracing filter |
+
+## Traefik Integration
+
+nscale requires specific Traefik configuration to ensure all traffic flows through it.
+
+### Static config (`traefik.yml`)
+
+```yaml
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+  consulCatalog:
+    exposedByDefault: false
+    strictChecks:
+      - "passing"
+      - "warning"
+```
+
+> **Important:** `strictChecks` must be a list of health status strings, not a boolean.
+> Setting `strictChecks: true` is silently interpreted as the literal string `"true"`,
+> causing all ConsulCatalog services to be rejected.
+
+### Dynamic config (`dynamic.yml`)
+
+```yaml
+http:
+  routers:
+    s2z-fallback:
+      rule: "HostRegexp(`^[a-z0-9-]+\\.localhost$`)"
+      priority: 1
+      entryPoints: [http]
+      service: s2z-nscale
+
+  services:
+    s2z-nscale:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: "http://nscale:8080"
+```
+
+### Nomad job tags
+
+Services must route through nscale on both cold and warm paths.
+Use `service=s2z-nscale@file` to point the ConsulCatalog router at nscale:
+
 ```hcl
-namespace "*" {
-  policy = "write"
-  capabilities = ["submit-job", "read-job", "scale-job"]
+service {
+  name     = "my-service"
+  provider = "consul"
+  port     = "http"
+
+  tags = [
+    "traefik.enable=true",
+    "traefik.http.routers.my-service.rule=Host(`my-service.localhost`)",
+    "traefik.http.routers.my-service.entryPoints=http",
+    "traefik.http.routers.my-service.service=s2z-nscale@file",
+  ]
+
+  check {
+    type     = "http"
+    path     = "/"
+    interval = "2s"
+    timeout  = "1s"
+  }
 }
 ```
 
-**Consul Policy** (see `local-test/nomad/scale-to-zero-consul-policy.hcl`):
-```hcl
-key_prefix "scale-to-zero/" {
-  policy = "write"
-}
-service_prefix "" {
-  policy = "write"
+This creates two routes to nscale:
+
+| Route | Provider | Priority | When active |
+|-------|----------|----------|-------------|
+| `my-service@consulcatalog` | ConsulCatalog | 30 | Service is running (healthy in Consul) |
+| `s2z-fallback@file` | File | 1 | Always (catches dormant services) |
+
+## Admin API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/healthz` | Liveness check |
+| `GET` | `/readyz` | Readiness check (verifies Redis) |
+| `POST` | `/admin/registry` | Register a single job (seeds activity) |
+| `POST` | `/admin/registry/sync` | Bulk-sync all job registrations (seeds activity) |
+
+### Registration payload
+
+```json
+{
+  "job_id": "my-service",
+  "service_name": "my-service",
+  "endpoint": "http://my-service.localhost",
+  "nomad_group": "main"
 }
 ```
 
-## 🏗️ Architecture Notes (V2 Configuration)
+Registration seeds an activity timestamp in Redis so the scaler can detect the job
+as idle once `idle_timeout` expires. Without this, registered jobs would never be
+discovered by the scale-down controller.
 
-The project evolved from a “verbose tags everywhere” setup to a simpler **V2** configuration:
+## Testing
 
-- **Infrastructure configuration** comes from environment variables (set once on Traefik / idle-scaler), instead of repeating addresses in every job.
-- **Per-job configuration** in Traefik tags is minimal (usually only `serviceName` and `timeout`).
-- **ACL support** is first-class:
-  - Nomad API calls include `X-Nomad-Token`
-  - Consul API calls include `X-Consul-Token`
+### Unit tests
 
-### Core environment variables
+```bash
+cargo nextest run --workspace
+```
 
-Traefik plugin (ScaleWaker) reads:
+### Integration / stress tests (k6)
 
-- `S2Z_NOMAD_ADDR` (default: `http://nomad.service.consul:4646`)
-- `S2Z_CONSUL_ADDR` (default: `http://consul.service.consul:8500`)
-- `S2Z_NOMAD_TOKEN` (optional)
-- `S2Z_CONSUL_TOKEN` (optional)
-- `S2Z_ACTIVITY_STORE` (`consul` or `redis`)
-- `S2Z_JOB_SPEC_STORE` (`consul` or `redis`)
-- `S2Z_REDIS_ADDR`, `S2Z_REDIS_PASSWORD` (optional, if using Redis)
+```bash
+cd integration
 
-Idle-scaler uses:
+# Multi-service chaos (50 services + random kills)
+docker compose --profile stress run --rm \
+  -e NSCALE_JOB_COUNT=50 \
+  -e NSCALE_DURATION=90s \
+  k6 run /scripts/multi-service.js
+```
 
-- `NOMAD_ADDR`, `CONSUL_ADDR`
-- `NOMAD_TOKEN`, `CONSUL_TOKEN` (optional)
-- `IDLE_CHECK_INTERVAL`, `DEFAULT_IDLE_TIMEOUT`
-- `STORE_TYPE` + Redis config when applicable
+### Multi-job management
 
-## Local development (recommended)
+```bash
+cd integration
 
-The quickest way to demo this to other developers is the single script:
+# Submit and register 50 jobs
+bash scripts/multi-job.sh submit 50
 
-- `local-test/scripts/start-local-with-acl.sh`
+# Check status
+bash scripts/multi-job.sh status 50
 
-It will:
+# Teardown
+bash scripts/multi-job.sh teardown 50
+```
 
-- start Consul + Nomad in dev mode **with ACLs enabled**
-- create least-privilege tokens and export them
-- start Traefik configured with the local plugin and Consul Catalog provider
-- build the idle-scaler and run it as a Nomad system job (with tokens)
+## How It Works
 
-It prints dashboards and tails Traefik logs. Stop with Ctrl-C (the script traps and cleans up the spawned processes).
+### 1. Registration
 
-### Smoke test
+A Nomad job is registered via the admin API. nscale stores the job in Redis and
+seeds an initial activity timestamp. The job can be at any count — nscale will
+scale it down once idle_timeout expires if there's no traffic.
 
-After the local stack is up:
+### 2. Cold-start wake
 
-1. Submit a sample job (for example):
+When all allocations are stopped, the ConsulCatalog route disappears. Traefik
+falls through to the `s2z-fallback` route (priority 1) → nscale. nscale looks
+up the job in its registry, calls Nomad to scale up, polls Consul for a healthy
+endpoint, then proxies the original request.
 
-   - `nomad job run local-test/sample-jobs/echo-s2z.hcl`
+### 3. Warm-path proxy
 
-2. Hit it through Traefik:
+When the service is healthy, Traefik creates a ConsulCatalog route (priority 30)
+that also points to `s2z-nscale@file`. The request still flows through nscale,
+which tracks it with `InFlightTracker`, spawns a heartbeat, and proxies to the
+real backend discovered via Consul.
 
-   - `curl -H 'Host: echo-s2z.localhost' http://localhost/`
+### 4. In-flight protection
 
-3. Scale it down to 0:
+Each proxied request increments an atomic counter via `InFlightTracker.track()`,
+returning an RAII guard that decrements on drop. A background heartbeat task
+refreshes activity in Redis every `idle_timeout / 3`. The scale-down controller
+checks `has_in_flight()` before any scale operation — if requests are active,
+it refreshes activity and skips.
 
-   - `nomad job scale echo-s2z main 0`
+### 5. Scale down
 
-4. Hit it again; it should wake back up:
+The scale-down controller runs a periodic sweep:
 
-   - `curl -H 'Host: echo-s2z.localhost' http://localhost/`
+1. Acquire distributed lock in Redis
+2. Query the activity sorted set for jobs with score < `now - idle_timeout`
+3. For each idle job, check `InFlightTracker` (in-flight requests block scale-down)
+4. Check Traefik traffic probe (request counter delta)
+5. If truly idle, scale Nomad job to `count = 0`
+6. Invalidate the coordinator cache and mark dormant
 
-## ACL policies (local-test)
+### 6. Nomad event stream
 
-The policies used by the local ACL script live in `local-test/nomad/`:
+nscale subscribes to Nomad's allocation event stream. When allocations transition
+to running, it records activity. When they stop, it marks the job dormant and
+clears the coordinator cache — enabling instant state transitions without polling.
 
-- `scale-to-zero-policy.hcl` — Nomad policy for submitting/reading/scaling jobs
-- `scale-to-zero-consul-policy.hcl` — Consul policy for KV writes and service discovery/cleanup
-- `consul-catalog-read-policy.hcl` — Consul policy used by Traefik’s Consul Catalog provider
-- `nomad-agent-consul-policy.hcl` — Consul policy used by the Nomad agent for service registration/deregistration
+## Project Structure
 
-## 📦 Repository Layout
+```
+├── Cargo.toml              # Workspace + binary definition
+├── src/main.rs             # Binary entrypoint
+├── crates/
+│   ├── nscale-core/        # Config, traits, shared types
+│   ├── nscale-nomad/       # Nomad API client
+│   ├── nscale-consul/      # Consul catalog client
+│   ├── nscale-store/       # Redis activity store + job registry
+│   ├── nscale-proxy/       # Reverse proxy + activity middleware
+│   ├── nscale-waker/       # Wake coordinator (state machine)
+│   └── nscale-scaler/      # Scale-down controller + traffic probe
+├── config/
+│   └── default.toml        # Default configuration
+├── integration/
+│   ├── docker-compose.yml  # Full local stack
+│   ├── jobs/               # Sample Nomad job specs
+│   ├── k6/                 # Stress & chaos test scripts
+│   ├── scripts/            # Helper scripts
+│   └── traefik/            # Traefik configuration
+├── Dockerfile              # Multi-stage production build
+├── CHANGELOG.md
+├── CONTRIBUTING.md
+└── LICENSE                 # Apache 2.0
+```
 
-- **`traefik-plugin/`** — ScaleWaker Traefik middleware plugin (Go)
-- **`idle-scaler/`** — Idle scaler agent (Go)
-- **`activity-store/`** — Shared store abstraction (Consul KV / Redis)
-- **`e2e/`** — Docker end-to-end harness, reusable topology/workload profiles, and Nomad job templates
-  - `e2e/profiles/` — Named `smoke` and `certification` targets that select Docker e2e topology size, workload expectations, scenario sets, and whether idle-scaler stays as a compose debug service or runs as a Nomad system job
-- **`local-test/`** — Local development configs and sample jobs
-  - `local-test/scripts/start-local-with-acl.sh` — One-shot local demo with ACLs
-  - `local-test/traefik/` — Dynamic Traefik config (fallback router/middleware)
-  - `local-test/sample-jobs/` — Sample Nomad jobs with minimal V2 tags
-  - `local-test/nomad/` — ACL policy HCLs for local testing
+## License
 
-## 🤝 Community & Support
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details on:
-
-- How to report bugs and request features
-- Development setup and testing
-- Code style and conventions
-- Pull request process
-
-### Getting Help
-
-- 📖 **Documentation**: Start with [LOCAL_TESTING.md](LOCAL_TESTING.md) for setup details
-- 🐛 **Bug Reports**: [Open an issue](https://github.com/Metatable-ai/nomad_scale_to_zero/issues/new) with reproduction steps
-- 💬 **Questions**: Use [GitHub Discussions](https://github.com/Metatable-ai/nomad_scale_to_zero/discussions) for questions
-- 🔧 **Component Docs**: See [activity-store/README.md](activity-store/README.md) and [idle-scaler/README.md](idle-scaler/README.md)
-
-### For Maintainers
-
-- 🚀 **Creating Releases**: See [RELEASE.md](RELEASE.md) for the complete release process
-- 📝 **Changelog**: See [CHANGELOG.md](CHANGELOG.md) for version history
-
-## 🗺️ Roadmap
-
-Future enhancements we're considering:
-
-- [ ] Metrics and monitoring integration (Prometheus/Grafana)
-- [ ] Support for multiple activity stores simultaneously
-- [ ] Configurable wake-up strategies (parallel scaling, gradual rollout)
-- [ ] Integration with other ingress controllers (nginx, envoy)
-- [ ] Webhook notifications for scale events
-- [ ] Advanced idle detection (request rate, resource usage)
-
-Have ideas? [Open a feature request](https://github.com/Metatable-ai/nomad_scale_to_zero/issues/new) or start a [discussion](https://github.com/Metatable-ai/nomad_scale_to_zero/discussions)!
-
-## 📄 License
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-Built with:
-- [HashiCorp Nomad](https://www.nomadproject.io/) - Workload orchestration
-- [HashiCorp Consul](https://www.consul.io/) - Service discovery and KV storage
-- [Traefik](https://traefik.io/) - Cloud-native ingress proxy
-
----
-
-**Ready to get started?** Check out our [Quick Start](#-quick-start) guide or dive into [LOCAL_TESTING.md](LOCAL_TESTING.md) for detailed setup instructions.
-
-**Want to contribute?** Read our [Contributing Guide](CONTRIBUTING.md) to get involved!
+Apache 2.0 — see [LICENSE](LICENSE).
