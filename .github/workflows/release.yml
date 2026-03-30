@@ -49,7 +49,7 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
@@ -96,7 +96,7 @@ jobs:
 
             ```bash
             # Example for Linux AMD64
-            curl -LO https://github.com/Metatable-ai/nomad_scale_to_zero/releases/download/${{ steps.version.outputs.VERSION }}/nscale-linux-amd64
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.VERSION }}/nscale-linux-amd64
             chmod +x nscale-linux-amd64
             ./nscale-linux-amd64
             ```
@@ -114,8 +114,8 @@ jobs:
 
             ## Documentation
 
-            - [README.md](https://github.com/Metatable-ai/nomad_scale_to_zero/blob/${{ steps.version.outputs.VERSION }}/README.md)
-            - [CHANGELOG.md](https://github.com/Metatable-ai/nomad_scale_to_zero/blob/${{ steps.version.outputs.VERSION }}/CHANGELOG.md)
-            - [CONTRIBUTING.md](https://github.com/Metatable-ai/nomad_scale_to_zero/blob/${{ steps.version.outputs.VERSION }}/CONTRIBUTING.md)
+            - [README.md](https://github.com/${{ github.repository }}/blob/${{ steps.version.outputs.VERSION }}/README.md)
+            - [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ steps.version.outputs.VERSION }}/CHANGELOG.md)
+            - [CONTRIBUTING.md](https://github.com/${{ github.repository }}/blob/${{ steps.version.outputs.VERSION }}/CONTRIBUTING.md)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
