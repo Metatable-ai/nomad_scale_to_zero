@@ -4,7 +4,7 @@ use std::time::Duration;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode, header},
+    http::{Method, Request, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use tracing::{error, info, instrument, warn};
@@ -16,6 +16,14 @@ use nscale_store::registry::JobRegistry;
 use nscale_waker::coordinator::WakeCoordinator;
 
 use crate::proxy::forward_request;
+
+struct CancelOnDrop(tokio_util::sync::CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 
 /// Shared application state for the proxy handler.
 #[derive(Clone)]
@@ -87,6 +95,16 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         "routing request to backend"
     );
 
+    let retry_method = match req.method() {
+        &Method::HEAD => Method::HEAD,
+        _ => Method::GET,
+    };
+    let retry_uri = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+
     // --- Track in-flight request so the scale-down controller skips this job ---
     let _in_flight_guard = state.in_flight.track(&job_id.0);
 
@@ -98,6 +116,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let heartbeat_interval = state.heartbeat_interval;
     let heartbeat_cancel = tokio_util::sync::CancellationToken::new();
     let heartbeat_cancel_clone = heartbeat_cancel.clone();
+    let _heartbeat_cancel_guard = CancelOnDrop(heartbeat_cancel.clone());
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(heartbeat_interval);
@@ -118,6 +137,24 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let result = match forward_request(&state.http_client, &endpoint, req).await {
         Ok(resp) => resp,
         Err(_status) => {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let retry_req = Request::builder()
+                .method(retry_method.clone())
+                .uri(retry_uri.as_str())
+                .body(Body::empty())
+                .unwrap();
+
+            if let Ok(resp) = forward_request(&state.http_client, &endpoint, retry_req).await {
+                info!(
+                    job_id = %job_id,
+                    endpoint = %endpoint,
+                    "retry: original backend recovered"
+                );
+                heartbeat_cancel.cancel();
+                return resp;
+            }
+
             // Backend unreachable — stale cache. Invalidate and re-wake.
             warn!(
                 job_id = %job_id,
@@ -147,8 +184,8 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
 
             // Build a minimal GET request to the same path since we consumed the original body
             let retry_req = Request::builder()
-                .method(axum::http::Method::GET)
-                .uri("/")
+                .method(retry_method)
+                .uri(retry_uri.as_str())
                 .body(Body::empty())
                 .unwrap();
 
@@ -163,4 +200,22 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     heartbeat_cancel.cancel();
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CancelOnDrop;
+
+    #[tokio::test]
+    async fn cancel_on_drop_cancels_token() {
+        let token = tokio_util::sync::CancellationToken::new();
+
+        {
+            let _guard = CancelOnDrop(token.clone());
+        }
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), token.cancelled())
+            .await
+            .expect("token should be canceled when guard drops");
+    }
 }

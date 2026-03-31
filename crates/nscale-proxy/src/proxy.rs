@@ -53,7 +53,13 @@ pub async fn forward_request(
     builder = builder.body(reqwest::Body::wrap_stream(body_stream));
 
     let response = builder.send().await.map_err(|e| {
-        error!(error = %e, "backend request failed");
+        error!(
+            error = %e,
+            is_connect = e.is_connect(),
+            is_timeout = e.is_timeout(),
+            status = ?e.status(),
+            "backend request failed"
+        );
         StatusCode::BAD_GATEWAY
     })?;
 

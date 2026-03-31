@@ -89,6 +89,8 @@ async fn main() {
 
     let http_client = reqwest::Client::builder()
         .pool_max_idle_per_host(100)
+        .timeout(config.proxy.request_timeout())
+        .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .expect("failed to build HTTP client");
 
