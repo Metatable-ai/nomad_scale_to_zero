@@ -19,7 +19,7 @@ scale_down_interval_secs = 5
 min_scale_down_age_secs = 10
 
 [default.proxy]
-request_timeout_secs = 30
+request_timeout_secs = 90
 request_buffer_size = 1000
 
 [default.traefik]

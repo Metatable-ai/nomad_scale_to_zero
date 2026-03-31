@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
 use nscale_core::job::JobId;
@@ -19,6 +20,9 @@ pub struct EventProcessor {
     coordinator: Arc<WakeCoordinator>,
     store: Arc<dyn ActivityStore>,
     registry: Arc<JobRegistry>,
+    /// Allocation IDs already seen as running — prevents redundant
+    /// `record_activity` calls on event stream replay / reconnect.
+    seen_running: Mutex<HashSet<String>>,
 }
 
 impl EventProcessor {
@@ -31,6 +35,7 @@ impl EventProcessor {
             coordinator,
             store,
             registry,
+            seen_running: Mutex::new(HashSet::new()),
         }
     }
 
@@ -78,6 +83,12 @@ impl EventProcessor {
             None => return Ok(()),
         };
 
+        let alloc_id = alloc
+            .get("ID")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
         let client_status = alloc
             .get("ClientStatus")
             .and_then(|v| v.as_str())
@@ -97,6 +108,7 @@ impl EventProcessor {
 
         debug!(
             job_id = %job_id,
+            alloc_id = %alloc_id,
             client_status,
             desired_status,
             event_type = %event.event_type,
@@ -105,16 +117,30 @@ impl EventProcessor {
 
         match (client_status, desired_status) {
             ("running", "run") => {
-                // Allocation is running — seed activity so idle detection starts
-                // from this moment.
-                debug!(job_id = %job_id, "allocation running, recording activity");
-                self.store.record_activity(&job_id).await?;
+                // Deduplicate: only record activity the first time we see
+                // this allocation reach running state. Prevents redundant
+                // writes on event stream replay / reconnect.
+                let is_new = {
+                    let mut seen = self.seen_running.lock().await;
+                    seen.insert(alloc_id.clone())
+                };
+                if is_new {
+                    debug!(job_id = %job_id, alloc_id = %alloc_id, "allocation running, recording activity");
+                    self.store.record_activity(&job_id).await?;
+                } else {
+                    debug!(job_id = %job_id, alloc_id = %alloc_id, "allocation already seen running, skipping activity");
+                }
             }
             ("complete" | "failed" | "lost", _) | (_, "stop") => {
-                // Allocation stopped — check if *all* allocations for this job
-                // are gone. If so, mark the job as dormant.
+                // Allocation stopped — remove from seen-running set and check
+                // if the job should be marked dormant.
+                {
+                    let mut seen = self.seen_running.lock().await;
+                    seen.remove(&alloc_id);
+                }
                 debug!(
                     job_id = %job_id,
+                    alloc_id = %alloc_id,
                     client_status,
                     desired_status,
                     "allocation stopped"

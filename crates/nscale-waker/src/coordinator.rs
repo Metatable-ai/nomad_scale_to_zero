@@ -104,6 +104,9 @@ impl WakeCoordinator {
 
                     return match tokio::time::timeout(self.wake_timeout, rx.recv()).await {
                         Ok(Ok(WakeResult::Ready(ep))) => Ok(ep),
+                        Ok(Ok(WakeResult::Cancelled)) => Err(NscaleError::WakeAbandoned {
+                            job_id: reg.job_id.0.clone(),
+                        }),
                         Ok(Ok(WakeResult::Failed(msg))) => {
                             Err(NscaleError::Nomad(format!("wake failed: {}", msg)))
                         }
@@ -140,6 +143,7 @@ impl WakeCoordinator {
                                 &semaphore,
                                 &reg_clone,
                                 timeout,
+                                &notify,
                             )
                             .await;
 
@@ -153,6 +157,15 @@ impl WakeCoordinator {
                                     endpoints.insert(reg_clone.job_id.0.clone(), endpoint.clone());
                                     state_clone.set_ready();
                                     let _ = notify.send(WakeResult::Ready(endpoint));
+                                }
+                                Err(NscaleError::WakeAbandoned { .. }) => {
+                                    info!(
+                                        job_id = %reg_clone.job_id,
+                                        "wake abandoned: all request handlers disconnected"
+                                    );
+                                    state_clone.set_dormant();
+                                    let _ = notify.send(WakeResult::Cancelled);
+                                    jobs.remove(&reg_clone.job_id.0);
                                 }
                                 Err(e) => {
                                     error!(
@@ -171,6 +184,9 @@ impl WakeCoordinator {
                         // Wait for the result
                         return match tokio::time::timeout(self.wake_timeout, rx.recv()).await {
                             Ok(Ok(WakeResult::Ready(ep))) => Ok(ep),
+                            Ok(Ok(WakeResult::Cancelled)) => Err(NscaleError::WakeAbandoned {
+                                job_id: reg.job_id.0.clone(),
+                            }),
                             Ok(Ok(WakeResult::Failed(msg))) => {
                                 Err(NscaleError::Nomad(format!("wake failed: {}", msg)))
                             }
@@ -272,9 +288,12 @@ async fn run_wake_task(
     semaphore: &tokio::sync::Semaphore,
     reg: &JobRegistration,
     timeout: Duration,
+    notify: &tokio::sync::broadcast::Sender<WakeResult>,
 ) -> Result<Endpoint> {
-    // Acquire semaphore to bound concurrent Nomad API calls
-    let _permit = semaphore
+    // Phase 1: Acquire semaphore to bound concurrent Nomad API calls.
+    // The permit is held only during scale_up (fast ~5ms), NOT during
+    // the entire wake (which includes 1-60s of Consul health polling).
+    let permit = semaphore
         .acquire()
         .await
         .map_err(|_| NscaleError::Nomad("wake semaphore closed".to_string()))?;
@@ -284,12 +303,40 @@ async fn run_wake_task(
         .scale_up(&reg.job_id, &reg.nomad_group, 1)
         .await?;
 
-    debug!(job_id = %reg.job_id, "waiting for healthy endpoint");
-    let endpoint = discovery
-        .wait_for_healthy(&reg.service_name, timeout)
-        .await?;
+    // Release semaphore early — other scale_up calls can proceed while
+    // this task waits for the service to become healthy.
+    drop(permit);
 
-    Ok(endpoint)
+    // Phase 2: Wait for healthy endpoint, but cancel if all subscribers
+    // have disconnected (i.e. every request handler was dropped).
+    debug!(job_id = %reg.job_id, "waiting for healthy endpoint");
+    tokio::select! {
+        result = discovery.wait_for_healthy(&reg.service_name, timeout) => result,
+        _ = wait_until_abandoned(notify) => {
+            Err(NscaleError::WakeAbandoned { job_id: reg.job_id.0.clone() })
+        }
+    }
+}
+
+/// Resolves when all broadcast subscribers have disconnected, indicating that
+/// no request handler is still waiting for the wake result.
+///
+/// Uses a polling approach with a brief grace period to avoid racing with new
+/// subscribers that arrive between checks.
+async fn wait_until_abandoned(notify: &tokio::sync::broadcast::Sender<WakeResult>) {
+    // Initial grace period: let subscribers settle after spawn.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    loop {
+        if notify.receiver_count() == 0 {
+            // Double-check after a short pause to avoid a race with an
+            // incoming request that is about to subscribe.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if notify.receiver_count() == 0 {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 #[cfg(test)]
@@ -541,5 +588,134 @@ mod tests {
         let refreshed = coord.refresh_endpoint(&reg, &current).await.unwrap();
         assert!(matches!(refreshed, EndpointRefresh::Missing));
         assert!(!coord.is_ready(&reg.job_id));
+    }
+
+    /// Mock discovery that delays health check to simulate slow container startup.
+    struct SlowDiscovery {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceDiscovery for SlowDiscovery {
+        async fn register_fallback(&self, _: &ServiceName, _: &Endpoint) -> Result<()> {
+            Ok(())
+        }
+        async fn deregister_fallback(&self, _: &ServiceName) -> Result<()> {
+            Ok(())
+        }
+        async fn wait_for_healthy(
+            &self,
+            _name: &ServiceName,
+            _timeout: Duration,
+        ) -> Result<Endpoint> {
+            tokio::time::sleep(self.delay).await;
+            Ok(Endpoint::new("10.0.0.1", 8080))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wake_abandoned_when_all_subscribers_disconnect() {
+        let orch = Arc::new(MockOrchestrator::new());
+        // Discovery takes 10s — long enough for us to drop all subscribers
+        let disc = Arc::new(SlowDiscovery {
+            delay: Duration::from_secs(10),
+        });
+        let coord = Arc::new(WakeCoordinator::new(
+            orch.clone(),
+            disc,
+            10,
+            Duration::from_secs(15),
+        ));
+
+        let reg = test_registration();
+
+        // Spawn a subscriber that will be dropped after 200ms
+        let coord_clone = coord.clone();
+        let reg_clone = reg.clone();
+        let handle = tokio::spawn(async move {
+            // This will start the wake task, then we time out quickly
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                coord_clone.ensure_running(&reg_clone),
+            )
+            .await
+        });
+
+        // Let the wake task start and the first subscriber time out
+        let result = handle.await.unwrap();
+        assert!(result.is_err(), "subscriber should have timed out");
+
+        // The wake task is now running with 0 subscribers.
+        // Give it time to detect abandonment (1s grace + 250ms double-check)
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // State should be reverted to dormant (entry removed)
+        assert!(
+            !coord.is_ready(&reg.job_id),
+            "abandoned wake should revert to dormant"
+        );
+
+        // scale_up should have been called (we don't cancel the scale_up)
+        assert_eq!(
+            orch.scale_up_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_semaphore_released_after_scale_up_not_after_health() {
+        let orch = Arc::new(MockOrchestrator::new());
+        // Discovery takes 2s
+        let disc = Arc::new(SlowDiscovery {
+            delay: Duration::from_millis(500),
+        });
+        let coord = Arc::new(WakeCoordinator::new(
+            orch.clone(),
+            disc,
+            // Only 1 permit to prove it's released early
+            1,
+            Duration::from_secs(5),
+        ));
+
+        let reg1 = JobRegistration {
+            job_id: JobId("job-1".into()),
+            service_name: ServiceName("svc-1".into()),
+            nomad_group: "web".into(),
+        };
+        let reg2 = JobRegistration {
+            job_id: JobId("job-2".into()),
+            service_name: ServiceName("svc-2".into()),
+            nomad_group: "web".into(),
+        };
+
+        // Start both wakes concurrently with only 1 semaphore permit.
+        // If the semaphore is held during wait_for_healthy, the second
+        // wake would be blocked for the full first wake duration.
+        let c1 = coord.clone();
+        let r1 = reg1.clone();
+        let h1 = tokio::spawn(async move { c1.ensure_running(&r1).await });
+
+        let c2 = coord.clone();
+        let r2 = reg2.clone();
+        let h2 = tokio::spawn(async move { c2.ensure_running(&r2).await });
+
+        // Both should complete within ~1s (overlapping health waits),
+        // NOT 2× sequential = 2s.
+        let deadline = Duration::from_millis(1500);
+        let (r1, r2) =
+            tokio::time::timeout(deadline, async { (h1.await.unwrap(), h2.await.unwrap()) })
+                .await
+                .expect(
+                    "both wakes should complete within the deadline (semaphore released early)",
+                );
+
+        assert!(r1.is_ok());
+        assert!(r2.is_ok());
+        assert_eq!(
+            orch.scale_up_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
     }
 }

@@ -83,6 +83,7 @@ where
             // long-running requests.
             if let Some(ref id) = job_id {
                 let job = JobId(id.clone());
+                debug!(job_id = %id, source = "middleware-start", "recording activity");
                 if let Err(e) = store.record_activity(&job).await {
                     warn!(job_id = %id, error = %e, "failed to record start activity");
                 }
@@ -95,10 +96,9 @@ where
                 let store = store.clone();
                 tokio::spawn(async move {
                     let job = JobId(id.clone());
+                    debug!(job_id = %id, source = "middleware-end", "recording activity");
                     if let Err(e) = store.record_activity(&job).await {
                         warn!(job_id = %id, error = %e, "failed to record activity");
-                    } else {
-                        debug!(job_id = %id, "recorded activity");
                     }
                 });
             }

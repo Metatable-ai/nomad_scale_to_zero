@@ -7,7 +7,7 @@ use axum::{
     http::{Method, Request, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::JobId;
@@ -133,13 +133,22 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let heartbeat_cancel_clone = heartbeat_cancel.clone();
     let _heartbeat_cancel_guard = CancelOnDrop(heartbeat_cancel.clone());
 
+    // Cap heartbeat duration at 2× the request timeout so it cannot
+    // outlive the handler by more than a bounded amount.
+    let max_heartbeat_duration = state.heartbeat_interval * 6 + std::time::Duration::from_secs(60);
     tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + max_heartbeat_duration;
         let mut ticker = tokio::time::interval(heartbeat_interval);
         ticker.tick().await; // first tick is immediate, skip it
         loop {
             tokio::select! {
                 _ = heartbeat_cancel_clone.cancelled() => break,
+                _ = tokio::time::sleep_until(deadline) => {
+                    warn!(job_id = %heartbeat_job, "heartbeat exceeded max duration, stopping");
+                    break;
+                }
                 _ = ticker.tick() => {
+                    debug!(job_id = %heartbeat_job, source = "heartbeat", "recording activity");
                     if let Err(e) = heartbeat_store.record_activity(&heartbeat_job).await {
                         warn!(job_id = %heartbeat_job, error = %e, "activity heartbeat failed");
                     }

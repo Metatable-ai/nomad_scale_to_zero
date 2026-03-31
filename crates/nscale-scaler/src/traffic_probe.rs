@@ -65,6 +65,16 @@ impl TrafficProbe {
         }
     }
 
+    /// Remove the cached baseline for a job so the next `has_active_traffic`
+    /// check starts fresh.  Called after a successful scale-down to avoid
+    /// stale counters causing a false-positive on the next wake cycle.
+    pub async fn clear_baseline(&self, job_id: &JobId) {
+        let service_label = format!("{}@{}", job_id.0, self.provider);
+        let mut last = self.last_counts.lock().await;
+        last.remove(&service_label);
+        debug!(job_id = %job_id, "cleared traffic probe baseline");
+    }
+
     /// Scrape Traefik Prometheus metrics and extract
     /// `traefik_service_requests_total{service="<label>"}`.
     async fn scrape_request_count(&self, service_label: &str) -> Result<u64> {
@@ -151,5 +161,27 @@ traefik_service_requests_total{code="200",method="GET",protocol="http",service="
     #[test]
     fn test_parse_empty_body() {
         assert_eq!(parse_service_requests_total("", "foo@consulcatalog"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_clear_baseline_removes_cached_count() {
+        let probe = TrafficProbe::new("http://unused:8080", "consulcatalog");
+        let job_id = JobId("test-job".into());
+        let service_label = format!("{}@consulcatalog", job_id.0);
+
+        // Seed a baseline
+        {
+            let mut last = probe.last_counts.lock().await;
+            last.insert(service_label.clone(), Some(42));
+        }
+
+        // Verify it exists
+        assert!(probe.last_counts.lock().await.contains_key(&service_label));
+
+        // Clear it
+        probe.clear_baseline(&job_id).await;
+
+        // Verify it's gone
+        assert!(!probe.last_counts.lock().await.contains_key(&service_label));
     }
 }
