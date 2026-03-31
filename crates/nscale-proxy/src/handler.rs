@@ -4,18 +4,28 @@ use std::time::Duration;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode, header},
+    http::{Method, Request, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::JobId;
 use nscale_core::traits::ActivityStore;
 use nscale_store::registry::JobRegistry;
-use nscale_waker::coordinator::WakeCoordinator;
+use nscale_waker::coordinator::{EndpointRefresh, WakeCoordinator};
 
 use crate::proxy::forward_request;
+
+const TRANSIENT_RETRY_BACKOFF_MS: [u64; 2] = [100, 250];
+
+struct CancelOnDrop(tokio_util::sync::CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 
 /// Shared application state for the proxy handler.
 #[derive(Clone)]
@@ -27,6 +37,22 @@ pub struct AppState {
     pub activity_store: Arc<dyn ActivityStore>,
     /// Interval for refreshing activity during long-running proxied requests.
     pub heartbeat_interval: Duration,
+}
+
+fn replayable_method(method: &Method) -> Option<Method> {
+    match *method {
+        Method::GET => Some(Method::GET),
+        Method::HEAD => Some(Method::HEAD),
+        _ => None,
+    }
+}
+
+fn build_retry_request(method: &Method, uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(method.clone())
+        .uri(uri)
+        .body(Body::empty())
+        .expect("retry request should reuse a valid method and URI")
 }
 
 /// Main request handler.
@@ -87,6 +113,13 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         "routing request to backend"
     );
 
+    let replay_method = replayable_method(req.method());
+    let retry_uri = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+
     // --- Track in-flight request so the scale-down controller skips this job ---
     let _in_flight_guard = state.in_flight.track(&job_id.0);
 
@@ -98,14 +131,24 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let heartbeat_interval = state.heartbeat_interval;
     let heartbeat_cancel = tokio_util::sync::CancellationToken::new();
     let heartbeat_cancel_clone = heartbeat_cancel.clone();
+    let _heartbeat_cancel_guard = CancelOnDrop(heartbeat_cancel.clone());
 
+    // Cap heartbeat duration at 2× the request timeout so it cannot
+    // outlive the handler by more than a bounded amount.
+    let max_heartbeat_duration = state.heartbeat_interval * 6 + std::time::Duration::from_secs(60);
     tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + max_heartbeat_duration;
         let mut ticker = tokio::time::interval(heartbeat_interval);
         ticker.tick().await; // first tick is immediate, skip it
         loop {
             tokio::select! {
                 _ = heartbeat_cancel_clone.cancelled() => break,
+                _ = tokio::time::sleep_until(deadline) => {
+                    warn!(job_id = %heartbeat_job, "heartbeat exceeded max duration, stopping");
+                    break;
+                }
                 _ = ticker.tick() => {
+                    debug!(job_id = %heartbeat_job, source = "heartbeat", "recording activity");
                     if let Err(e) = heartbeat_store.record_activity(&heartbeat_job).await {
                         warn!(job_id = %heartbeat_job, error = %e, "activity heartbeat failed");
                     }
@@ -114,47 +157,164 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         }
     });
 
-    // --- 4. Forward request to backend; retry once on connection failure ---
+    // --- 4. Forward request to backend; retry transient transport failures ---
     let result = match forward_request(&state.http_client, &endpoint, req).await {
         Ok(resp) => resp,
-        Err(_status) => {
-            // Backend unreachable — stale cache. Invalidate and re-wake.
-            warn!(
+        Err(err) if !err.is_retryable_transport() => {
+            error!(
                 job_id = %job_id,
                 endpoint = %endpoint,
-                "backend unreachable, invalidating cache and re-waking"
+                error = %err,
+                status = ?err.response_status(),
+                "backend request failed"
             );
-            state.coordinator.invalidate(&job_id);
-
-            let endpoint = match state.coordinator.ensure_running(&registration).await {
-                Ok(ep) => ep,
-                Err(e) => {
-                    error!(job_id = %job_id, error = %e, "retry wake failed");
-                    heartbeat_cancel.cancel();
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("retry wake error: {e}"),
-                    )
-                        .into_response();
-                }
+            heartbeat_cancel.cancel();
+            return err.status_code().into_response();
+        }
+        Err(mut err) => {
+            let Some(retry_method) = replay_method else {
+                error!(
+                    job_id = %job_id,
+                    endpoint = %endpoint,
+                    error = %err,
+                    is_connect = err.is_connect(),
+                    is_timeout = err.is_timeout(),
+                    status = ?err.response_status(),
+                    "backend request failed and request is not safe to replay"
+                );
+                heartbeat_cancel.cancel();
+                return err.status_code().into_response();
             };
 
-            info!(
-                job_id = %job_id,
-                endpoint = %endpoint,
-                "retry: routing request to new backend"
-            );
+            for (attempt, delay_ms) in TRANSIENT_RETRY_BACKOFF_MS.iter().enumerate() {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
 
-            // Build a minimal GET request to the same path since we consumed the original body
-            let retry_req = Request::builder()
-                .method(axum::http::Method::GET)
-                .uri("/")
-                .body(Body::empty())
-                .unwrap();
+                let retry_req = build_retry_request(&retry_method, retry_uri.as_str());
+                match forward_request(&state.http_client, &endpoint, retry_req).await {
+                    Ok(resp) => {
+                        info!(
+                            job_id = %job_id,
+                            endpoint = %endpoint,
+                            attempts = attempt + 1,
+                            "retry: original backend recovered"
+                        );
+                        heartbeat_cancel.cancel();
+                        return resp;
+                    }
+                    Err(retry_err) if retry_err.is_retryable_transport() => {
+                        err = retry_err;
+                    }
+                    Err(retry_err) => {
+                        error!(
+                            job_id = %job_id,
+                            endpoint = %endpoint,
+                            error = %retry_err,
+                            status = ?retry_err.response_status(),
+                            "backend request failed after retry"
+                        );
+                        heartbeat_cancel.cancel();
+                        return retry_err.status_code().into_response();
+                    }
+                }
+            }
 
-            match forward_request(&state.http_client, &endpoint, retry_req).await {
-                Ok(resp) => resp,
-                Err(status) => status.into_response(),
+            match state
+                .coordinator
+                .refresh_endpoint(&registration, &endpoint)
+                .await
+            {
+                Ok(EndpointRefresh::Confirmed(_)) => {
+                    error!(
+                        job_id = %job_id,
+                        endpoint = %endpoint,
+                        error = %err,
+                        is_connect = err.is_connect(),
+                        is_timeout = err.is_timeout(),
+                        status = ?err.response_status(),
+                        "backend request failed after transient retries; cached endpoint still healthy"
+                    );
+                    heartbeat_cancel.cancel();
+                    return err.status_code().into_response();
+                }
+                Ok(EndpointRefresh::Updated(refreshed_endpoint)) => {
+                    warn!(
+                        job_id = %job_id,
+                        old_endpoint = %endpoint,
+                        endpoint = %refreshed_endpoint,
+                        "healthy endpoint changed after transient transport failures, retrying refreshed endpoint"
+                    );
+
+                    let retry_req = build_retry_request(&retry_method, retry_uri.as_str());
+                    match forward_request(&state.http_client, &refreshed_endpoint, retry_req).await
+                    {
+                        Ok(resp) => resp,
+                        Err(refresh_err) => {
+                            error!(
+                                job_id = %job_id,
+                                endpoint = %refreshed_endpoint,
+                                error = %refresh_err,
+                                is_connect = refresh_err.is_connect(),
+                                is_timeout = refresh_err.is_timeout(),
+                                status = ?refresh_err.response_status(),
+                                "backend request failed after endpoint refresh"
+                            );
+                            refresh_err.status_code().into_response()
+                        }
+                    }
+                }
+                Ok(EndpointRefresh::Missing) => {
+                    warn!(
+                        job_id = %job_id,
+                        endpoint = %endpoint,
+                        "backend no longer has a running endpoint, re-waking"
+                    );
+
+                    let endpoint = match state.coordinator.ensure_running(&registration).await {
+                        Ok(ep) => ep,
+                        Err(e) => {
+                            error!(job_id = %job_id, error = %e, "retry wake failed");
+                            heartbeat_cancel.cancel();
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                format!("retry wake error: {e}"),
+                            )
+                                .into_response();
+                        }
+                    };
+
+                    info!(
+                        job_id = %job_id,
+                        endpoint = %endpoint,
+                        "retry: routing request to re-woken backend"
+                    );
+
+                    let retry_req = build_retry_request(&retry_method, retry_uri.as_str());
+                    match forward_request(&state.http_client, &endpoint, retry_req).await {
+                        Ok(resp) => resp,
+                        Err(rewake_err) => {
+                            error!(
+                                job_id = %job_id,
+                                endpoint = %endpoint,
+                                error = %rewake_err,
+                                is_connect = rewake_err.is_connect(),
+                                is_timeout = rewake_err.is_timeout(),
+                                status = ?rewake_err.response_status(),
+                                "backend request failed after re-wake"
+                            );
+                            rewake_err.status_code().into_response()
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        job_id = %job_id,
+                        endpoint = %endpoint,
+                        error = %e,
+                        "failed to refresh backend endpoint after transient transport failures"
+                    );
+                    heartbeat_cancel.cancel();
+                    return StatusCode::BAD_GATEWAY.into_response();
+                }
             }
         }
     };
@@ -163,4 +323,32 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     heartbeat_cancel.cancel();
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::Method;
+
+    use super::{CancelOnDrop, replayable_method};
+
+    #[tokio::test]
+    async fn cancel_on_drop_cancels_token() {
+        let token = tokio_util::sync::CancellationToken::new();
+
+        {
+            let _guard = CancelOnDrop(token.clone());
+        }
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), token.cancelled())
+            .await
+            .expect("token should be canceled when guard drops");
+    }
+
+    #[test]
+    fn replayable_method_only_allows_safe_retries() {
+        assert_eq!(replayable_method(&Method::GET), Some(Method::GET));
+        assert_eq!(replayable_method(&Method::HEAD), Some(Method::HEAD));
+        assert_eq!(replayable_method(&Method::POST), None);
+        assert_eq!(replayable_method(&Method::PUT), None);
+    }
 }

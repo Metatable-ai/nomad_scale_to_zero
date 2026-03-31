@@ -1,6 +1,6 @@
 [package]
 name = "nscale-scaler"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 
 [dependencies]
@@ -14,6 +14,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+dashmap = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }

@@ -5,6 +5,12 @@ pub enum NscaleError {
     #[error("nomad API error: {0}")]
     Nomad(String),
 
+    #[error("nomad deployment in progress for job {job_id} while attempting {operation}")]
+    DeploymentInProgress {
+        job_id: String,
+        operation: &'static str,
+    },
+
     #[error("consul API error: {0}")]
     Consul(String),
 
@@ -22,6 +28,9 @@ pub enum NscaleError {
 
     #[error("job not ready: {0}")]
     JobNotReady(String),
+
+    #[error("wake abandoned for job {job_id}: all subscribers disconnected")]
+    WakeAbandoned { job_id: String },
 
     #[error("configuration error: {0}")]
     Config(String),

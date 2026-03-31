@@ -18,6 +18,8 @@ pub struct WakeState {
 pub enum WakeResult {
     Ready(Endpoint),
     Failed(String),
+    /// All request handlers disconnected before the wake completed.
+    Cancelled,
 }
 
 impl WakeState {

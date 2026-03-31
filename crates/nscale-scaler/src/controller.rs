@@ -1,10 +1,12 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+use nscale_core::error::{NscaleError, Result};
 use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::JobId;
 use nscale_core::traits::{ActivityStore, Orchestrator};
@@ -14,6 +16,8 @@ use nscale_waker::coordinator::WakeCoordinator;
 use crate::traffic_probe::TrafficProbe;
 
 const SCALE_DOWN_LOCK_KEY: &str = "nscale:lock:scale-down";
+/// Initial backoff when scale-down is blocked by an active deployment.
+const DEPLOYMENT_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Background controller that detects idle jobs and scales them to zero.
 ///
@@ -30,6 +34,8 @@ pub struct ScaleDownController {
     interval: Duration,
     lock_ttl: Duration,
     cancel: CancellationToken,
+    /// Jobs deferred due to active deployments; maps job_id → earliest retry time.
+    deferred_jobs: Arc<DashMap<String, Instant>>,
 }
 
 impl ScaleDownController {
@@ -58,6 +64,7 @@ impl ScaleDownController {
             interval,
             lock_ttl,
             cancel,
+            deferred_jobs: Arc::new(DashMap::new()),
         }
     }
 
@@ -88,7 +95,7 @@ impl ScaleDownController {
     }
 
     #[instrument(skip(self))]
-    async fn tick(&self) -> nscale_core::error::Result<()> {
+    async fn tick(&self) -> Result<()> {
         // Try to acquire distributed lock
         if !self
             .store
@@ -129,11 +136,23 @@ impl ScaleDownController {
 
     #[instrument(skip(self), fields(job_id = %job_id))]
     async fn scale_down_job(&self, job_id: &JobId) {
+        // --- Deferred guard: skip jobs that are backing off after a blocked deployment ---
+        if let Some(entry) = self.deferred_jobs.get(&job_id.0) {
+            if Instant::now() < *entry {
+                debug!("job is deferred due to active deployment, skipping");
+                return;
+            }
+            // Backoff expired — remove and proceed
+            drop(entry);
+            self.deferred_jobs.remove(&job_id.0);
+        }
+
         // --- In-flight guard: skip if nscale is actively proxying requests for this job ---
         if self.in_flight.has_in_flight(&job_id.0) {
             let count = self.in_flight.count(&job_id.0);
             info!(
                 in_flight = count,
+                source = "in-flight-guard",
                 "job has in-flight proxy requests, refreshing activity"
             );
             if let Err(e) = self.store.record_activity(job_id).await {
@@ -146,7 +165,10 @@ impl ScaleDownController {
         if let Some(probe) = &self.traffic_probe {
             match probe.has_active_traffic(job_id).await {
                 Ok(true) => {
-                    info!("service has active Traefik traffic, refreshing activity");
+                    info!(
+                        source = "traffic-guard",
+                        "service has active Traefik traffic, refreshing activity"
+                    );
                     if let Err(e) = self.store.record_activity(job_id).await {
                         warn!(error = %e, "failed to refresh activity for active service");
                     }
@@ -181,23 +203,58 @@ impl ScaleDownController {
         info!(group = %registration.nomad_group, "scaling down idle job");
 
         // Scale down via Nomad
-        match self
+        let scale_down_result = self
             .orchestrator
             .scale_down(&registration.job_id, &registration.nomad_group)
-            .await
-        {
-            Ok(()) => {
-                info!("job scaled to zero");
-                // Update coordinator state
-                self.coordinator.mark_dormant(job_id);
-                // Remove activity record
-                if let Err(e) = self.store.remove_activity(job_id).await {
-                    warn!(error = %e, "failed to remove activity after scale-down");
-                }
+            .await;
+
+        handle_scale_down_result(
+            self.store.as_ref(),
+            self.coordinator.as_ref(),
+            self.traffic_probe.as_deref(),
+            &self.deferred_jobs,
+            job_id,
+            scale_down_result,
+        )
+        .await;
+    }
+}
+
+async fn handle_scale_down_result(
+    store: &dyn ActivityStore,
+    coordinator: &WakeCoordinator,
+    traffic_probe: Option<&TrafficProbe>,
+    deferred_jobs: &DashMap<String, Instant>,
+    job_id: &JobId,
+    scale_down_result: Result<()>,
+) {
+    match scale_down_result {
+        Ok(()) => {
+            info!("job scaled to zero");
+            coordinator.mark_dormant(job_id);
+            if let Err(e) = store.remove_activity(job_id).await {
+                warn!(error = %e, "failed to remove activity after scale-down");
             }
-            Err(e) => {
-                error!(error = %e, "failed to scale down job");
+            // Clear stale traffic baseline so next wake starts fresh.
+            if let Some(probe) = traffic_probe {
+                probe.clear_baseline(job_id).await;
             }
+            // Clear any pending deferral.
+            deferred_jobs.remove(&job_id.0);
+        }
+        Err(NscaleError::DeploymentInProgress { operation, .. }) => {
+            info!(
+                operation,
+                "scale-down blocked by active deployment, deferring for {}s",
+                DEPLOYMENT_BACKOFF.as_secs(),
+            );
+            deferred_jobs.insert(job_id.0.clone(), Instant::now() + DEPLOYMENT_BACKOFF);
+            if let Err(e) = store.record_activity(job_id).await {
+                warn!(error = %e, "failed to refresh activity after blocked scale-down");
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "failed to scale down job");
         }
     }
 }
@@ -223,8 +280,7 @@ impl Drop for LockGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nscale_core::error::Result;
-    use nscale_core::job::{Endpoint, ServiceName};
+    use nscale_core::job::{Endpoint, JobRegistration, ServiceName};
     use nscale_core::traits::ServiceDiscovery;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -260,6 +316,8 @@ mod tests {
     struct MockStore {
         idle_jobs: Vec<JobId>,
         lock_acquired: std::sync::atomic::AtomicBool,
+        record_activity_calls: AtomicU32,
+        remove_activity_calls: AtomicU32,
     }
 
     impl MockStore {
@@ -267,6 +325,8 @@ mod tests {
             Self {
                 idle_jobs,
                 lock_acquired: std::sync::atomic::AtomicBool::new(false),
+                record_activity_calls: AtomicU32::new(0),
+                remove_activity_calls: AtomicU32::new(0),
             }
         }
     }
@@ -274,6 +334,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ActivityStore for MockStore {
         async fn record_activity(&self, _: &JobId) -> Result<()> {
+            self.record_activity_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         async fn get_idle_jobs(&self, _: Duration) -> Result<Vec<JobId>> {
@@ -287,6 +348,7 @@ mod tests {
             Ok(())
         }
         async fn remove_activity(&self, _: &JobId) -> Result<()> {
+            self.remove_activity_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         async fn has_activity(&self, job_id: &JobId) -> Result<bool> {
@@ -294,7 +356,6 @@ mod tests {
         }
     }
 
-    #[expect(dead_code)]
     struct MockDiscovery;
 
     #[async_trait::async_trait]
@@ -307,6 +368,14 @@ mod tests {
         }
         async fn wait_for_healthy(&self, _: &ServiceName, _: Duration) -> Result<Endpoint> {
             Ok(Endpoint::new("10.0.0.1", 8080))
+        }
+    }
+
+    fn test_registration(job_id: &str) -> JobRegistration {
+        JobRegistration {
+            job_id: JobId(job_id.into()),
+            service_name: ServiceName(format!("svc-{job_id}")),
+            nomad_group: "web".into(),
         }
     }
 
@@ -413,5 +482,84 @@ mod tests {
         drop(_guard_a);
         assert!(!tracker.has_in_flight("job-a"));
         assert!(tracker.has_in_flight("job-b"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_scale_down_result_refreshes_activity_when_nomad_is_busy() {
+        let orch = Arc::new(MockOrchestrator::new());
+        let disc = Arc::new(MockDiscovery);
+        let coordinator = WakeCoordinator::new(orch, disc, 10, Duration::from_secs(2));
+        let store = MockStore::new(vec![]);
+        let deferred = DashMap::new();
+        let registration = test_registration("busy-job");
+
+        coordinator.ensure_running(&registration).await.unwrap();
+        assert!(coordinator.is_ready(&registration.job_id));
+
+        handle_scale_down_result(
+            &store,
+            &coordinator,
+            None,
+            &deferred,
+            &registration.job_id,
+            Err(NscaleError::DeploymentInProgress {
+                job_id: registration.job_id.0.clone(),
+                operation: "scale down",
+            }),
+        )
+        .await;
+
+        assert_eq!(store.record_activity_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(store.remove_activity_calls.load(Ordering::Relaxed), 0);
+        assert!(coordinator.is_ready(&registration.job_id));
+        // Job should now be deferred
+        assert!(deferred.contains_key(&registration.job_id.0));
+    }
+
+    #[tokio::test]
+    async fn test_handle_scale_down_result_marks_dormant_on_success() {
+        let orch = Arc::new(MockOrchestrator::new());
+        let disc = Arc::new(MockDiscovery);
+        let coordinator = WakeCoordinator::new(orch, disc, 10, Duration::from_secs(2));
+        let store = MockStore::new(vec![]);
+        let deferred = DashMap::new();
+        let registration = test_registration("idle-job");
+
+        coordinator.ensure_running(&registration).await.unwrap();
+        assert!(coordinator.is_ready(&registration.job_id));
+
+        handle_scale_down_result(
+            &store,
+            &coordinator,
+            None,
+            &deferred,
+            &registration.job_id,
+            Ok(()),
+        )
+        .await;
+
+        assert_eq!(store.record_activity_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(store.remove_activity_calls.load(Ordering::Relaxed), 1);
+        assert!(!coordinator.is_ready(&registration.job_id));
+    }
+
+    #[tokio::test]
+    async fn test_deferred_job_skipped_until_backoff_expires() {
+        let deferred: DashMap<String, Instant> = DashMap::new();
+        let job_id = "deferred-job";
+
+        // Defer the job 30s into the future
+        deferred.insert(job_id.to_string(), Instant::now() + Duration::from_secs(30));
+
+        // Should be skipped (backoff not expired)
+        assert!(deferred.get(job_id).is_some());
+        let entry = deferred.get(job_id).unwrap();
+        assert!(Instant::now() < *entry, "backoff should still be active");
+        drop(entry);
+
+        // Simulate backoff expiry by setting time in the past
+        deferred.insert(job_id.to_string(), Instant::now() - Duration::from_secs(1));
+        let entry = deferred.get(job_id).unwrap();
+        assert!(Instant::now() >= *entry, "backoff should have expired");
     }
 }
