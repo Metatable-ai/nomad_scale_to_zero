@@ -182,6 +182,17 @@ impl Orchestrator for NomadClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 400
+                && body
+                    .to_lowercase()
+                    .contains("scaling blocked due to active deployment")
+            {
+                info!(job_id = %job_id, "scale-down blocked by active deployment, deferring scale-down");
+                return Err(NscaleError::DeploymentInProgress {
+                    job_id: job_id.0.clone(),
+                    operation: "scale down",
+                });
+            }
             return Err(NscaleError::Nomad(format!(
                 "POST /v1/job/{}/scale (down) returned {}: {}",
                 job_id, status, body
@@ -260,6 +271,50 @@ mod tests {
         let client = NomadClient::new(&mock_server.uri(), None).unwrap();
         let result = client.scale_down(&"test-job".into(), "web").await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_scale_down_active_deployment_returns_deployment_in_progress() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/job/test-job/scale"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string("job scaling blocked due to active deployment"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = NomadClient::new(&mock_server.uri(), None).unwrap();
+        let result = client.scale_down(&"test-job".into(), "web").await;
+
+        assert!(matches!(
+            result,
+            Err(NscaleError::DeploymentInProgress {
+                job_id,
+                operation: "scale down"
+            }) if job_id == "test-job"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_scale_down_other_400_error_fails() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/job/test-job/scale"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string("job not found or invalid group"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = NomadClient::new(&mock_server.uri(), None).unwrap();
+        let result = client.scale_down(&"test-job".into(), "web").await;
+        assert!(result.is_err(), "other 400 errors should still fail");
     }
 
     #[tokio::test]

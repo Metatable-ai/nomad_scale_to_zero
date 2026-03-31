@@ -5,6 +5,12 @@ pub enum NscaleError {
     #[error("nomad API error: {0}")]
     Nomad(String),
 
+    #[error("nomad deployment in progress for job {job_id} while attempting {operation}")]
+    DeploymentInProgress {
+        job_id: String,
+        operation: &'static str,
+    },
+
     #[error("consul API error: {0}")]
     Consul(String),
 

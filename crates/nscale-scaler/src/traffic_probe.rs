@@ -54,9 +54,12 @@ impl TrafficProbe {
         last.insert(service_label, Some(current_total));
 
         match prev {
-            // First observation — no baseline yet.  Assume traffic IS present
-            // (fail-open) so we don't accidentally scale down an active service.
-            None => Ok(true),
+            // First observation — no baseline yet.  If the counter is already
+            // non-zero, assume traffic is present (fail-open) so we don't
+            // accidentally scale down an active service.  A zero counter means
+            // Traefik has definitely not routed anything, so it is safe to
+            // proceed with scale-down immediately.
+            None => Ok(current_total > 0),
             // Subsequent observations — compare with previous count.
             Some(p) => Ok(current_total > p),
         }

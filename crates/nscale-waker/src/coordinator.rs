@@ -22,6 +22,13 @@ pub struct WakeCoordinator {
     endpoints: Arc<DashMap<String, Endpoint>>,
 }
 
+#[derive(Debug, Clone)]
+pub enum EndpointRefresh {
+    Confirmed(Endpoint),
+    Updated(Endpoint),
+    Missing,
+}
+
 impl WakeCoordinator {
     pub fn new(
         orchestrator: Arc<dyn Orchestrator>,
@@ -211,6 +218,48 @@ impl WakeCoordinator {
         info!(job_id = %job_id, "invalidated stale endpoint cache");
     }
 
+    /// Re-check the running endpoint for a job without forcing a scale-up.
+    /// This is used after transient proxy transport failures to avoid
+    /// invalidating a healthy cached endpoint unless Nomad disagrees.
+    #[instrument(skip(self, reg, current), fields(job_id = %reg.job_id, endpoint = %current))]
+    pub async fn refresh_endpoint(
+        &self,
+        reg: &JobRegistration,
+        current: &Endpoint,
+    ) -> Result<EndpointRefresh> {
+        let job_key = reg.job_id.0.clone();
+
+        match self.orchestrator.get_healthy_endpoint(&reg.job_id).await? {
+            Some(endpoint) => {
+                self.endpoints.insert(job_key.clone(), endpoint.clone());
+                if let Some(state) = self.jobs.get(&job_key) {
+                    state.set_ready();
+                }
+
+                if endpoint.host == current.host && endpoint.port == current.port {
+                    debug!(endpoint = %endpoint, "healthy endpoint unchanged after transport failure");
+                    Ok(EndpointRefresh::Confirmed(endpoint))
+                } else {
+                    info!(
+                        old_endpoint = %current,
+                        endpoint = %endpoint,
+                        "healthy endpoint changed after transport failure"
+                    );
+                    Ok(EndpointRefresh::Updated(endpoint))
+                }
+            }
+            None => {
+                self.endpoints.remove(&job_key);
+                if let Some(state) = self.jobs.get(&job_key) {
+                    state.set_dormant();
+                }
+                self.jobs.remove(&job_key);
+                debug!("no running endpoint found while refreshing cached endpoint");
+                Ok(EndpointRefresh::Missing)
+            }
+        }
+    }
+
     /// Check if a job is currently in the Ready state.
     pub fn is_ready(&self, job_id: &JobId) -> bool {
         self.endpoints.contains_key(&job_id.0)
@@ -247,18 +296,28 @@ async fn run_wake_task(
 mod tests {
     use super::*;
     use nscale_core::job::ServiceName;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicU32;
 
     /// Mock orchestrator that counts calls.
     struct MockOrchestrator {
         scale_up_calls: AtomicU32,
+        healthy_endpoint: Mutex<Option<Endpoint>>,
     }
 
     impl MockOrchestrator {
         fn new() -> Self {
             Self {
                 scale_up_calls: AtomicU32::new(0),
+                healthy_endpoint: Mutex::new(Some(Endpoint::new("10.0.0.1", 8080))),
             }
+        }
+
+        fn set_healthy_endpoint(&self, endpoint: Option<Endpoint>) {
+            *self
+                .healthy_endpoint
+                .lock()
+                .expect("healthy endpoint lock should succeed") = endpoint;
         }
     }
 
@@ -277,7 +336,11 @@ mod tests {
             Ok(1)
         }
         async fn get_healthy_endpoint(&self, _job_id: &JobId) -> Result<Option<Endpoint>> {
-            Ok(Some(Endpoint::new("10.0.0.1", 8080)))
+            Ok(self
+                .healthy_endpoint
+                .lock()
+                .expect("healthy endpoint lock should succeed")
+                .clone())
         }
     }
 
@@ -437,5 +500,46 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_endpoint_updates_cached_endpoint() {
+        let orch = Arc::new(MockOrchestrator::new());
+        let disc = Arc::new(MockDiscovery);
+        let coord = WakeCoordinator::new(orch.clone(), disc, 10, Duration::from_secs(2));
+
+        let reg = test_registration();
+        let current = coord.ensure_running(&reg).await.unwrap();
+
+        orch.set_healthy_endpoint(Some(Endpoint::new("10.0.0.2", 9090)));
+
+        let refreshed = coord.refresh_endpoint(&reg, &current).await.unwrap();
+        match refreshed {
+            EndpointRefresh::Updated(endpoint) => {
+                assert_eq!(endpoint.host, "10.0.0.2");
+                assert_eq!(endpoint.port, 9090);
+            }
+            other => panic!("expected updated endpoint, got {other:?}"),
+        }
+
+        let cached = coord.ensure_running(&reg).await.unwrap();
+        assert_eq!(cached.host, "10.0.0.2");
+        assert_eq!(cached.port, 9090);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_endpoint_missing_clears_cache() {
+        let orch = Arc::new(MockOrchestrator::new());
+        let disc = Arc::new(MockDiscovery);
+        let coord = WakeCoordinator::new(orch.clone(), disc, 10, Duration::from_secs(2));
+
+        let reg = test_registration();
+        let current = coord.ensure_running(&reg).await.unwrap();
+
+        orch.set_healthy_endpoint(None);
+
+        let refreshed = coord.refresh_endpoint(&reg, &current).await.unwrap();
+        assert!(matches!(refreshed, EndpointRefresh::Missing));
+        assert!(!coord.is_ready(&reg.job_id));
     }
 }

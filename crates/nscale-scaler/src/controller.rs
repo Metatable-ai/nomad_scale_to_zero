@@ -5,6 +5,7 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+use nscale_core::error::{NscaleError, Result};
 use nscale_core::inflight::InFlightTracker;
 use nscale_core::job::JobId;
 use nscale_core::traits::{ActivityStore, Orchestrator};
@@ -88,7 +89,7 @@ impl ScaleDownController {
     }
 
     #[instrument(skip(self))]
-    async fn tick(&self) -> nscale_core::error::Result<()> {
+    async fn tick(&self) -> Result<()> {
         // Try to acquire distributed lock
         if !self
             .store
@@ -181,23 +182,46 @@ impl ScaleDownController {
         info!(group = %registration.nomad_group, "scaling down idle job");
 
         // Scale down via Nomad
-        match self
+        let scale_down_result = self
             .orchestrator
             .scale_down(&registration.job_id, &registration.nomad_group)
-            .await
-        {
-            Ok(()) => {
-                info!("job scaled to zero");
-                // Update coordinator state
-                self.coordinator.mark_dormant(job_id);
-                // Remove activity record
-                if let Err(e) = self.store.remove_activity(job_id).await {
-                    warn!(error = %e, "failed to remove activity after scale-down");
-                }
+            .await;
+
+        handle_scale_down_result(
+            self.store.as_ref(),
+            self.coordinator.as_ref(),
+            job_id,
+            scale_down_result,
+        )
+        .await;
+    }
+}
+
+async fn handle_scale_down_result(
+    store: &dyn ActivityStore,
+    coordinator: &WakeCoordinator,
+    job_id: &JobId,
+    scale_down_result: Result<()>,
+) {
+    match scale_down_result {
+        Ok(()) => {
+            info!("job scaled to zero");
+            coordinator.mark_dormant(job_id);
+            if let Err(e) = store.remove_activity(job_id).await {
+                warn!(error = %e, "failed to remove activity after scale-down");
             }
-            Err(e) => {
-                error!(error = %e, "failed to scale down job");
+        }
+        Err(NscaleError::DeploymentInProgress { operation, .. }) => {
+            info!(
+                operation,
+                "scale-down blocked by active deployment, refreshing activity"
+            );
+            if let Err(e) = store.record_activity(job_id).await {
+                warn!(error = %e, "failed to refresh activity after blocked scale-down");
             }
+        }
+        Err(e) => {
+            error!(error = %e, "failed to scale down job");
         }
     }
 }
@@ -223,8 +247,7 @@ impl Drop for LockGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nscale_core::error::Result;
-    use nscale_core::job::{Endpoint, ServiceName};
+    use nscale_core::job::{Endpoint, JobRegistration, ServiceName};
     use nscale_core::traits::ServiceDiscovery;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -260,6 +283,8 @@ mod tests {
     struct MockStore {
         idle_jobs: Vec<JobId>,
         lock_acquired: std::sync::atomic::AtomicBool,
+        record_activity_calls: AtomicU32,
+        remove_activity_calls: AtomicU32,
     }
 
     impl MockStore {
@@ -267,6 +292,8 @@ mod tests {
             Self {
                 idle_jobs,
                 lock_acquired: std::sync::atomic::AtomicBool::new(false),
+                record_activity_calls: AtomicU32::new(0),
+                remove_activity_calls: AtomicU32::new(0),
             }
         }
     }
@@ -274,6 +301,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ActivityStore for MockStore {
         async fn record_activity(&self, _: &JobId) -> Result<()> {
+            self.record_activity_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         async fn get_idle_jobs(&self, _: Duration) -> Result<Vec<JobId>> {
@@ -287,6 +315,7 @@ mod tests {
             Ok(())
         }
         async fn remove_activity(&self, _: &JobId) -> Result<()> {
+            self.remove_activity_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         async fn has_activity(&self, job_id: &JobId) -> Result<bool> {
@@ -294,7 +323,6 @@ mod tests {
         }
     }
 
-    #[expect(dead_code)]
     struct MockDiscovery;
 
     #[async_trait::async_trait]
@@ -307,6 +335,14 @@ mod tests {
         }
         async fn wait_for_healthy(&self, _: &ServiceName, _: Duration) -> Result<Endpoint> {
             Ok(Endpoint::new("10.0.0.1", 8080))
+        }
+    }
+
+    fn test_registration(job_id: &str) -> JobRegistration {
+        JobRegistration {
+            job_id: JobId(job_id.into()),
+            service_name: ServiceName(format!("svc-{job_id}")),
+            nomad_group: "web".into(),
         }
     }
 
@@ -413,5 +449,50 @@ mod tests {
         drop(_guard_a);
         assert!(!tracker.has_in_flight("job-a"));
         assert!(tracker.has_in_flight("job-b"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_scale_down_result_refreshes_activity_when_nomad_is_busy() {
+        let orch = Arc::new(MockOrchestrator::new());
+        let disc = Arc::new(MockDiscovery);
+        let coordinator = WakeCoordinator::new(orch, disc, 10, Duration::from_secs(2));
+        let store = MockStore::new(vec![]);
+        let registration = test_registration("busy-job");
+
+        coordinator.ensure_running(&registration).await.unwrap();
+        assert!(coordinator.is_ready(&registration.job_id));
+
+        handle_scale_down_result(
+            &store,
+            &coordinator,
+            &registration.job_id,
+            Err(NscaleError::DeploymentInProgress {
+                job_id: registration.job_id.0.clone(),
+                operation: "scale down",
+            }),
+        )
+        .await;
+
+        assert_eq!(store.record_activity_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(store.remove_activity_calls.load(Ordering::Relaxed), 0);
+        assert!(coordinator.is_ready(&registration.job_id));
+    }
+
+    #[tokio::test]
+    async fn test_handle_scale_down_result_marks_dormant_on_success() {
+        let orch = Arc::new(MockOrchestrator::new());
+        let disc = Arc::new(MockDiscovery);
+        let coordinator = WakeCoordinator::new(orch, disc, 10, Duration::from_secs(2));
+        let store = MockStore::new(vec![]);
+        let registration = test_registration("idle-job");
+
+        coordinator.ensure_running(&registration).await.unwrap();
+        assert!(coordinator.is_ready(&registration.job_id));
+
+        handle_scale_down_result(&store, &coordinator, &registration.job_id, Ok(())).await;
+
+        assert_eq!(store.record_activity_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(store.remove_activity_calls.load(Ordering::Relaxed), 1);
+        assert!(!coordinator.is_ready(&registration.job_id));
     }
 }
